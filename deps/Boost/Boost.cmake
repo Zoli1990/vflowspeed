@@ -7,27 +7,27 @@ if (APPLE AND CMAKE_OSX_ARCHITECTURES)
     elseif (CMAKE_OSX_ARCHITECTURES MATCHES "arm")
         set (_context_abi_line "-DBOOST_CONTEXT_ABI:STRING=aapcs")
     endif ()
-    set(_context_arch_line "-DBOOST_CONTEXT_ARCHITECTURE:STRING=${CMAKE_OSX_ARCHITECTURES}")
-    message(STATUS "BOOST param: ${_context_abi_line} ${_context_arch_line}")
+    set(_context_arch_line "-DBOOST_CONTEXT_ARCHITECTURE:STRING=\${CMAKE_OSX_ARCHITECTURES}")
+    message(STATUS "BOOST param: \${_context_abi_line} \${_context_arch_line}")
 endif ()
 
 if (MSVC)
     set(_msvc_target_arch "")
     if (CMAKE_GENERATOR_PLATFORM)
-        set(_msvc_target_arch "${CMAKE_GENERATOR_PLATFORM}")
+        set(_msvc_target_arch "\${CMAKE_GENERATOR_PLATFORM}")
     elseif (CMAKE_VS_PLATFORM_NAME)
-        set(_msvc_target_arch "${CMAKE_VS_PLATFORM_NAME}")
+        set(_msvc_target_arch "\${CMAKE_VS_PLATFORM_NAME}")
     elseif (DEFINED DEP_PLATFORM)
-        set(_msvc_target_arch "${DEP_PLATFORM}")
+        set(_msvc_target_arch "\${DEP_PLATFORM}")
     elseif (CMAKE_SYSTEM_PROCESSOR)
-        set(_msvc_target_arch "${CMAKE_SYSTEM_PROCESSOR}")
+        set(_msvc_target_arch "\${CMAKE_SYSTEM_PROCESSOR}")
     endif ()
-    string(TOUPPER "${_msvc_target_arch}" _msvc_target_arch)
+    string(TOUPPER "\${_msvc_target_arch}" _msvc_target_arch)
     if (_msvc_target_arch STREQUAL "ARM64" OR _msvc_target_arch STREQUAL "AARCH64")
         set(_context_abi_line "-DBOOST_CONTEXT_ABI:STRING=aapcs")
         set(_context_arch_line "-DBOOST_CONTEXT_ARCHITECTURE:STRING=arm64")
         set(_context_impl_line "-DBOOST_CONTEXT_IMPLEMENTATION:STRING=winfib")
-        message(STATUS "BOOST param: ${_context_abi_line} ${_context_arch_line} ${_context_impl_line}")
+        message(STATUS "BOOST param: \${_context_abi_line} \${_context_arch_line} \${_context_impl_line}")
     elseif (_msvc_target_arch STREQUAL "ARM64EC")
         # ARM64EC uses the x64-compatible ABI; the Windows Fiber implementation
         # needs no assembler, sidestepping fcontext arch detection entirely.
@@ -36,14 +36,14 @@ if (MSVC)
         # native lowering, no softintrin fallback); cobalt is in the same
         # C++20-era boat. Neither is used by BambuStudio.
         set(_boost_ec_extra_excludes "|json|cobalt")
-        message(STATUS "BOOST param: ${_context_impl_line}")
+        message(STATUS "BOOST param: \${_context_impl_line}")
     elseif (_msvc_target_arch STREQUAL "X64")
         # Pin arch AND abi: Boost.Context otherwise sniffs the HOST processor,
         # so building x64 deps on an ARM64 host selects armasm/aapcs and fails
         # (x86_64 + aapcs has no asm source; the x64 Windows ABI is 'ms').
         set(_context_abi_line "-DBOOST_CONTEXT_ABI:STRING=ms")
         set(_context_arch_line "-DBOOST_CONTEXT_ARCHITECTURE:STRING=x86_64")
-        message(STATUS "BOOST param: ${_context_abi_line} ${_context_arch_line}")
+        message(STATUS "BOOST param: \${_context_abi_line} \${_context_arch_line}")
     endif ()
 endif ()
 
@@ -51,21 +51,21 @@ bambustudio_add_cmake_project(Boost
     URL "https://github.com/boostorg/boost/releases/download/boost-1.84.0/boost-1.84.0.tar.gz"
     URL_HASH SHA256=4d27e9efed0f6f152dc28db6430b9d3dfb40c0345da7342eaa5a987dde57bd95
     LIST_SEPARATOR |
-    # Boost is extracted inside the parent vflowspeed worktree. Stop Git's
-    # repository discovery at the Boost source root so git apply does not
-    # treat the relative Boost paths as paths outside the parent worktree prefix.
-    PATCH_COMMAND ${CMAKE_COMMAND} -E env "GIT_CEILING_DIRECTORIES=<SOURCE_DIR>"
-        ${CMAKE_COMMAND} -E chdir <SOURCE_DIR>
-        git apply --verbose --ignore-space-change --whitespace=fix
-        ${CMAKE_CURRENT_LIST_DIR}/0001-FIX-OBS-cannot-start-streaming-on-MAC.patch
-        ${CMAKE_CURRENT_LIST_DIR}/0002-Boost-locale-source-group.patch
+    # The Boost source is extracted inside the vflowspeed worktree. Initialize
+    # a temporary Git repository inside Boost before applying Boost-relative
+    # patches, so Git cannot mistake the parent vflowspeed repository for root.
+    PATCH_COMMAND \${CMAKE_COMMAND}
+        -DSOURCE_DIR=<SOURCE_DIR>
+        -DPATCH_1=\${CMAKE_CURRENT_LIST_DIR}/0001-FIX-OBS-cannot-start-streaming-on-MAC.patch
+        -DPATCH_2=\${CMAKE_CURRENT_LIST_DIR}/0002-Boost-locale-source-group.patch
+        -P \${CMAKE_CURRENT_LIST_DIR}/ApplyPatches.cmake
     CMAKE_ARGS
-        -DBOOST_EXCLUDE_LIBRARIES:STRING=contract|fiber|numpy|wave|test${_boost_ec_extra_excludes}
+        -DBOOST_EXCLUDE_LIBRARIES:STRING=contract|fiber|numpy|wave|test\${_boost_ec_extra_excludes}
         -DBOOST_LOCALE_ENABLE_ICU:BOOL=OFF # do not link to libicu, breaks compatibility between distros
         -DBUILD_TESTING:BOOL=OFF
-        "${_context_abi_line}"
-        "${_context_arch_line}"
-        "${_context_impl_line}"
+        "\${_context_abi_line}"
+        "\${_context_arch_line}"
+        "\${_context_impl_line}"
 )
 
 set(DEP_Boost_DEPENDS ZLIB)
