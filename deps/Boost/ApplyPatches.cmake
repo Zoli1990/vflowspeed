@@ -26,7 +26,7 @@ execute_process(
     ERROR_VARIABLE git_init_error
 )
 
-if (NOT git_init_result EQUAL 0)
+if (NOT "${git_init_result}" STREQUAL "0")
     message(FATAL_ERROR
         "Could not initialize a temporary Git repository in the Boost source.\n"
         "${git_init_output}\n${git_init_error}")
@@ -48,7 +48,7 @@ execute_process(
 message(STATUS "${git_apply_output}")
 message(STATUS "${git_apply_error}")
 
-if (NOT git_apply_result EQUAL 0)
+if (NOT "${git_apply_result}" STREQUAL "0")
     message(FATAL_ERROR
         "Applying the Boost patches failed (exit code ${git_apply_result}).")
 endif ()
