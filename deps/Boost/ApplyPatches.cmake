@@ -45,8 +45,14 @@ execute_process(
     ERROR_VARIABLE git_apply_error
 )
 
-message(STATUS "${git_apply_output}")
-message(STATUS "${git_apply_error}")
+set(git_apply_log "${git_apply_output}${git_apply_error}")
+message(STATUS "${git_apply_log}")
+
+if (git_apply_log MATCHES "Skipped patch")
+    message(FATAL_ERROR
+        "Git skipped one or more Boost patches. Check that the temporary repository "
+        "was initialized in the Boost source directory.")
+endif ()
 
 if (NOT "${git_apply_result}" STREQUAL "0")
     message(FATAL_ERROR
