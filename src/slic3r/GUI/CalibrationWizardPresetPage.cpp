@@ -1,0 +1,3859 @@
+#include <regex>
+#include "CalibrationWizardPresetPage.hpp"
+#include "I18N.hpp"
+#include "Widgets/Label.hpp"
+#include "MsgDialog.hpp"
+#include "libslic3r/Print.hpp"
+#include "BBLUtil.hpp"
+
+#include "DeviceCore/DevConfig.h"
+#include "DeviceCore/DevExtruderSystem.h"
+#include "DeviceCore/DevFilaBlackList.h"
+#include "DeviceCore/DevFilaSystem.h"
+#include "DeviceCore/DevStorage.h"
+#include "DeviceCore/DevNozzleSystem.h"
+#include "DeviceCore/DevNozzleRack.h"
+#include "DeviceCore/DevConfigUtil.h"
+#include "DeviceCore/DevUpgrade.h"
+
+#include "DeviceCore/DevManager.h"
+#include "DeviceCore/DevFilaSystem.h"
+#include "libslic3r/Log.hpp"
+
+#define CALIBRATION_LABEL_SIZE wxSize(FromDIP(150), FromDIP(24))
+#define SYNC_BUTTON_SIZE (wxSize(FromDIP(50), FromDIP(50)))
+#define CALIBRATION_TEXT_INPUT_Y_SIZE FromDIP(20)
+
+#define LEFT_EXTRUDER_ID  1
+#define RIGHT_EXTRUDER_ID 0
+
+#define MAX_SLOT_NUM 4
+
+// Max printable objects in the auto Flow Dynamics (PA line) rack template
+// (resources/calib/pressure_advance/auto_pa_line_single_all.3mf). Upper bound when
+// addressing rack / sub-AMS model indices. Adjust if the template object count changes.
+static constexpr int MAX_AUTO_PA_CALI_OBJECTS = 34;
+
+namespace Slic3r { namespace GUI {
+static int PA_LINE = 0;
+static int PA_PATTERN = 1;
+
+static std::vector<NozzleVolumeType> volumes = { nvtStandard, nvtHighFlow, nvtTPUHighFlow, nvtTPU285, nvtHybrid};
+
+static DynamicPrintConfig get_empty_dynamic_print_config() {
+    DynamicPrintConfig empty_config;
+    empty_config.set_key_value("filament_id", new ConfigOptionStrings{""});
+    empty_config.set_key_value("tag_uid", new ConfigOptionStrings{""});
+    empty_config.set_key_value("filament_type", new ConfigOptionStrings{""});
+    empty_config.set_key_value("tray_name", new ConfigOptionStrings{""});
+    empty_config.set_key_value("filament_colour", new ConfigOptionStrings{""});
+    empty_config.set_key_value("filament_exist", new ConfigOptionBools{false});
+
+    return empty_config;
+}
+
+static std::map<int, DynamicPrintConfig> build_filament_ams_list(MachineObject* obj)
+{
+    std::map<int, DynamicPrintConfig> filament_ams_list;
+    if (!obj) return filament_ams_list;
+
+    auto build_tray_config = [](DevAmsTray const &tray, std::string const &name, std::string ams_id, std::string slot_id) {
+        BOOST_LOG_TRIVIAL(info) << boost::format("build_filament_ams_list: name %1% setting_id %2% type %3% color %4%")
+                    % name % tray.setting_id % tray.m_fila_type % tray.color;
+        DynamicPrintConfig tray_config;
+        tray_config.set_key_value("filament_id", new ConfigOptionStrings{tray.setting_id});
+        tray_config.set_key_value("tag_uid", new ConfigOptionStrings{tray.tag_uid});
+        tray_config.set_key_value("ams_id", new ConfigOptionStrings{ams_id});
+        tray_config.set_key_value("slot_id", new ConfigOptionStrings{slot_id});
+        tray_config.set_key_value("filament_type", new ConfigOptionStrings{tray.m_fila_type});
+        tray_config.set_key_value("tray_name", new ConfigOptionStrings{ name });
+        tray_config.set_key_value("filament_colour", new ConfigOptionStrings{into_u8(wxColour("#" + tray.color).GetAsString(wxC2S_HTML_SYNTAX))});
+        tray_config.set_key_value("filament_multi_colour", new ConfigOptionStrings{});
+        tray_config.set_key_value("filament_colour_type", new ConfigOptionStrings{std::to_string(tray.ctype)});
+        tray_config.set_key_value("filament_exist", new ConfigOptionBools{tray.is_exists});
+        std::optional<FilamentBaseInfo> info;
+        if (wxGetApp().preset_bundle) {
+            info = wxGetApp().preset_bundle->get_filament_by_filament_id(tray.setting_id);
+        }
+        tray_config.set_key_value("filament_is_support", new ConfigOptionBools{ info.has_value() ? info->is_support : false});
+        for (int i = 0; i < tray.cols.size(); ++i) {
+            tray_config.opt<ConfigOptionStrings>("filament_multi_colour")->values.push_back(into_u8(wxColour("#" + tray.cols[i]).GetAsString(wxC2S_HTML_SYNTAX)));
+        }
+        return tray_config;
+    };
+
+    if (obj->ams_support_virtual_tray) {
+        int extruder = 0x10000; // Main (first) extruder at right
+        for (auto & vt_tray : obj->vt_slot) {
+            filament_ams_list.emplace(extruder + stoi(vt_tray.id), build_tray_config(vt_tray, "Ext",vt_tray.id, "0"));//254 or 255
+            extruder = 0;
+        }
+    }
+
+    auto get_ams_name = [](int ams_id, int slot_id)->std::string {
+        if (ams_id >= 0 && ams_id < 64) {
+            char slot_name = slot_id + '1';
+            return std::string(1, 'A' + ams_id) + std::string(1, slot_name);
+        } else if (ams_id >= 128 && ams_id < 153) {
+            return "HT-" + std::string(1, 'A' + (ams_id - 128));
+        } else {
+            assert(false);
+        }
+        return std::string();
+    };
+
+    auto list = obj->GetFilaSystem()->GetAmsList();
+
+    for (const auto& ams : list) {
+        for (auto extruder_id : ams.second->GetBindedExtruderSet()) {
+            int extruder = extruder_id ? 0 : 0x10000; // Main (first) extruder at right
+            for (auto tray : ams.second->GetTrays()) {
+                int ams_id = -1;
+                int slot_id = -1;
+                int tray_id = -1;
+                try {
+                    ams_id  = std::stoi(ams.first);
+                    slot_id = std::stoi(tray.first);
+                    tray_id = obj->GetFilaSystem()->GetTrayIdByAmsSlotId(ams_id, slot_id);
+
+                    filament_ams_list.emplace(extruder + tray_id, build_tray_config(*tray.second, get_ams_name(ams_id, slot_id), std::to_string(ams_id), std::to_string(slot_id)));
+                } catch(...) {
+                    BOOST_LOG_TRIVIAL(error) << "invalid " << KV(log_key::ams_id, ams.first) << "or " << KV(log_key::slot_id, tray.first);
+                }
+            }
+        }
+    }
+    return filament_ams_list;
+}
+
+CaliPresetCaliStagePanel::CaliPresetCaliStagePanel(
+    wxWindow* parent,
+    wxWindowID id,
+    const wxPoint& pos,
+    const wxSize& size,
+    long style)
+    : wxPanel(parent, id, pos, size, style)
+{
+    SetBackgroundColour(*wxWHITE);
+
+    m_top_sizer = new wxBoxSizer(wxVERTICAL);
+
+    create_panel(this);
+
+    this->SetSizer(m_top_sizer);
+    m_top_sizer->Fit(this);
+}
+
+void CaliPresetCaliStagePanel::msw_rescale()
+{
+    flow_ratio_input->GetTextCtrl()->SetSize(wxSize(-1, CALIBRATION_TEXT_INPUT_Y_SIZE));
+}
+
+void CaliPresetCaliStagePanel::create_panel(wxWindow* parent)
+{
+    auto title = new Label(parent, _L("Calibration Type"));
+    title->SetFont(Label::Head_14);
+    m_top_sizer->Add(title);
+    m_top_sizer->AddSpacer(FromDIP(15));
+
+    m_complete_radioBox = new wxRadioButton(parent, wxID_ANY, _L("Complete Calibration"));
+    m_complete_radioBox->SetForegroundColour(*wxBLACK);
+
+    m_complete_radioBox->SetValue(true);
+    m_stage = CALI_MANUAL_STAGE_1;
+    m_top_sizer->Add(m_complete_radioBox);
+    m_top_sizer->AddSpacer(FromDIP(10));
+    m_fine_radioBox = new wxRadioButton(parent, wxID_ANY, _L("Fine Calibration based on flow ratio"));
+    m_fine_radioBox->SetForegroundColour(*wxBLACK);
+    m_top_sizer->Add(m_fine_radioBox);
+
+    input_panel = new wxPanel(parent);
+    input_panel->Hide();
+    auto input_sizer = new wxBoxSizer(wxHORIZONTAL);
+    input_panel->SetSizer(input_sizer);
+    flow_ratio_input = new TextInput(input_panel, wxEmptyString, "", "", wxDefaultPosition, CALIBRATION_FROM_TO_INPUT_SIZE);
+    flow_ratio_input->GetTextCtrl()->SetValidator(wxTextValidator(wxFILTER_NUMERIC));
+    float default_flow_ratio = 1.0f;
+    auto flow_ratio_str = wxString::Format("%.2f", default_flow_ratio);
+    flow_ratio_input->GetTextCtrl()->SetValue(flow_ratio_str);
+    input_sizer->AddSpacer(FromDIP(18));
+    input_sizer->Add(flow_ratio_input, 0, wxTOP, FromDIP(10));
+    m_top_sizer->Add(input_panel);
+
+    m_top_sizer->AddSpacer(PRESET_GAP);
+    // events
+    m_complete_radioBox->Bind(wxEVT_RADIOBUTTON, [this](auto& e) {
+        m_stage_panel_parent->get_current_object()->GetCalib()->SetFlowRatioCalibType(COMPLETE_CALIBRATION);
+        input_panel->Show(false);
+        m_stage = CALI_MANUAL_STAGE_1;
+        GetParent()->Layout();
+        GetParent()->Fit();
+        });
+    m_fine_radioBox->Bind(wxEVT_RADIOBUTTON, [this](auto& e) {
+        m_stage_panel_parent->get_current_object()->GetCalib()->SetFlowRatioCalibType(FINE_CALIBRATION);
+        input_panel->Show();
+        m_stage = CALI_MANUAL_STAGE_2;
+        GetParent()->Layout();
+        GetParent()->Fit();
+        });
+    flow_ratio_input->GetTextCtrl()->Bind(wxEVT_TEXT_ENTER, [this](auto& e) {
+        float flow_ratio = 0.0f;
+        if (!CalibUtils::validate_input_flow_ratio(flow_ratio_input->GetTextCtrl()->GetValue(), &flow_ratio)) {
+            MessageDialog msg_dlg(nullptr, _L("Please input a valid value (0.0 < flow ratio < 2.0)"), wxEmptyString, wxICON_WARNING | wxOK);
+            msg_dlg.ShowModal();
+        }
+        auto flow_ratio_str = wxString::Format("%.3f", flow_ratio);
+        flow_ratio_input->GetTextCtrl()->SetValue(flow_ratio_str);
+        m_flow_ratio_value = flow_ratio;
+        });
+    flow_ratio_input->GetTextCtrl()->Bind(wxEVT_KILL_FOCUS, [this](auto& e) {
+        float flow_ratio = 0.0f;
+        if (!CalibUtils::validate_input_flow_ratio(flow_ratio_input->GetTextCtrl()->GetValue(), &flow_ratio)) {
+            MessageDialog msg_dlg(nullptr, _L("Please input a valid value (0.0 < flow ratio < 2.0)"), wxEmptyString, wxICON_WARNING | wxOK);
+            msg_dlg.ShowModal();
+        }
+        auto flow_ratio_str = wxString::Format("%.3f", flow_ratio);
+        flow_ratio_input->GetTextCtrl()->SetValue(flow_ratio_str);
+        m_flow_ratio_value = flow_ratio;
+        e.Skip();
+        });
+    Bind(wxEVT_LEFT_DOWN, [this](auto& e) {
+        SetFocusIgnoringChildren();
+        });
+}
+
+void CaliPresetCaliStagePanel::set_cali_stage(CaliPresetStage stage, float value)
+{
+    if (stage == CaliPresetStage::CALI_MANUAL_STAGE_1) {
+        wxCommandEvent radioBox_evt(wxEVT_RADIOBUTTON);
+        radioBox_evt.SetEventObject(m_complete_radioBox);
+        wxPostEvent(m_complete_radioBox, radioBox_evt);
+        m_stage = stage;
+    }
+    else if(stage == CaliPresetStage::CALI_MANUAL_STAGE_2){
+        wxCommandEvent radioBox_evt(wxEVT_RADIOBUTTON);
+        radioBox_evt.SetEventObject(m_fine_radioBox);
+        wxPostEvent(m_fine_radioBox, radioBox_evt);
+        m_stage = stage;
+        m_flow_ratio_value = value;
+    }
+}
+
+void CaliPresetCaliStagePanel::get_cali_stage(CaliPresetStage& stage, float& value)
+{
+    stage = m_stage;
+    value = (m_stage == CALI_MANUAL_STAGE_2) ? m_flow_ratio_value : value;
+}
+
+void CaliPresetCaliStagePanel::set_flow_ratio_value(float flow_ratio)
+{
+    flow_ratio_input->GetTextCtrl()->SetValue(wxString::Format("%.2f", flow_ratio));
+    m_flow_ratio_value = flow_ratio;
+}
+
+void CaliPresetCaliStagePanel::set_flow_ratio_calibration_type(FlowRatioCalibrationType type) {
+    if (type == COMPLETE_CALIBRATION) {
+        m_complete_radioBox->SetValue(true);
+        m_stage = CaliPresetStage::CALI_MANUAL_STAGE_1;
+        input_panel->Hide();
+    }
+    else if (type == FINE_CALIBRATION) {
+        m_fine_radioBox->SetValue(true);
+        m_stage = CaliPresetStage::CALI_MANUAL_STAGE_2;
+        input_panel->Show();
+    }
+    GetParent()->Layout();
+    GetParent()->Fit();
+}
+
+CaliComboBox::CaliComboBox(wxWindow* parent,
+    wxString                              title,
+    wxArrayString                         values,
+    int                                   default_index, // default delected id
+    std::function<void(wxCommandEvent&)>  on_value_change,
+    wxWindowID                            id,
+    const wxPoint&                        pos,
+    const wxSize&                         size,
+    long                                  style)
+    : wxPanel(parent, id, pos, size, style)
+    , m_title(title)
+    , m_on_value_change_call_back(on_value_change)
+{
+    SetBackgroundColour(*wxWHITE);
+    m_top_sizer = new wxBoxSizer(wxVERTICAL);
+    m_top_sizer->AddSpacer(PRESET_GAP);
+    auto combo_title = new Label(this, title);
+    combo_title->SetFont(Label::Head_14);
+    combo_title->Wrap(-1);
+    m_top_sizer->Add(combo_title, 0, wxALL, 0);
+    m_top_sizer->AddSpacer(FromDIP(10));
+    m_combo_box = new ComboBox(this, wxID_ANY, "", wxDefaultPosition, CALIBRATION_COMBOX_SIZE, 0, nullptr, wxCB_READONLY);
+    m_top_sizer->Add(m_combo_box, 0, wxALL, 0);
+    m_top_sizer->AddSpacer(PRESET_GAP);
+
+    this->SetSizer(m_top_sizer);
+    m_top_sizer->Fit(this);
+
+    // set values
+    for (int i = 0; i < values.size(); ++i) {
+        m_combo_box->AppendString(values[i]);
+    }
+    m_combo_box->SetSelection(default_index);
+
+    // bind call back function
+    if (m_on_value_change_call_back)
+        m_combo_box->Bind(wxEVT_COMBOBOX, m_on_value_change_call_back);
+}
+
+int CaliComboBox::get_selection() const
+{
+    if (m_combo_box)
+        return m_combo_box->GetSelection();
+
+    return 0;
+}
+
+wxString CaliComboBox::get_value() const
+{
+    if (m_combo_box)
+        return m_combo_box->GetValue();
+
+    return wxString();
+}
+
+void CaliComboBox::set_values(const wxArrayString &values)
+{
+    if (m_combo_box) {
+        for (int i = 0; i < values.size(); ++i) {
+            m_combo_box->AppendString(values[i]);
+        }
+        m_combo_box->SetSelection(0);
+    }
+}
+
+CaliPresetWarningPanel::CaliPresetWarningPanel(
+    wxWindow* parent,
+    wxWindowID id,
+    const wxPoint& pos,
+    const wxSize& size,
+    long style)
+    : wxPanel(parent, id, pos, size, style)
+{
+    SetBackgroundColour(*wxWHITE);
+
+    m_top_sizer = new wxBoxSizer(wxHORIZONTAL);
+
+    create_panel(this);
+
+    this->SetSizer(m_top_sizer);
+    m_top_sizer->Fit(this);
+}
+
+void CaliPresetWarningPanel::create_panel(wxWindow* parent)
+{
+    m_warning_text = new Label(parent, wxEmptyString);
+    m_warning_text->SetFont(Label::Body_13);
+    //m_warning_text->SetForegroundColour(wxColour(230, 92, 92));
+    m_warning_text->Wrap(CALIBRATION_TEXT_MAX_LENGTH);
+    m_top_sizer->Add(m_warning_text, 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(5));
+}
+
+void CaliPresetWarningPanel::set_warning(wxString text)
+{
+    m_warning_text->SetLabel(text);
+}
+
+void CaliPresetWarningPanel::set_color(wxColour color)
+{
+    m_warning_text->SetForegroundColour(color);
+}
+
+CaliPresetCustomRangePanel::CaliPresetCustomRangePanel(
+    wxWindow* parent,
+    int input_value_nums,
+    wxWindowID id,
+    const wxPoint& pos,
+    const wxSize& size,
+    long style)
+    : wxPanel(parent, id, pos, size, style)
+    , m_input_value_nums(input_value_nums)
+{
+    SetBackgroundColour(*wxWHITE);
+
+    m_title_texts.resize(input_value_nums);
+    m_value_inputs.resize(input_value_nums);
+
+    m_top_sizer = new wxBoxSizer(wxHORIZONTAL);
+    create_panel(this);
+
+    this->SetSizer(m_top_sizer);
+    m_top_sizer->Fit(this);
+}
+
+void CaliPresetCustomRangePanel::msw_rescale()
+{
+    for (TextInput *value_input : m_value_inputs)
+        value_input->GetTextCtrl()->SetSize(wxSize(-1, CALIBRATION_TEXT_INPUT_Y_SIZE));
+}
+
+void CaliPresetCustomRangePanel::set_unit(wxString unit)
+{
+    for (size_t i = 0; i < m_input_value_nums; ++i) {
+        m_value_inputs[i]->SetLabel(unit);
+    }
+}
+
+void CaliPresetCustomRangePanel::set_titles(wxArrayString titles)
+{
+    if (titles.size() != m_input_value_nums)
+        return;
+
+    for (size_t i = 0; i < m_input_value_nums; ++i) {
+        m_title_texts[i]->SetLabel(titles[i]);
+    }
+}
+
+void CaliPresetCustomRangePanel::set_values(wxArrayString values) {
+    if (values.size() != m_input_value_nums)
+        return;
+
+    for (size_t i = 0; i < m_input_value_nums; ++i) {
+        m_value_inputs[i]->GetTextCtrl()->SetValue(values[i]);
+    }
+}
+
+wxArrayString CaliPresetCustomRangePanel::get_values()
+{
+    wxArrayString result;
+    for (size_t i = 0; i < m_input_value_nums; ++i) {
+        result.push_back(m_value_inputs[i]->GetTextCtrl()->GetValue());
+    }
+    return result;
+}
+
+void CaliPresetCustomRangePanel::create_panel(wxWindow* parent)
+{
+    wxBoxSizer* horiz_sizer;
+    horiz_sizer = new wxBoxSizer(wxHORIZONTAL);
+    for (size_t i = 0; i < m_input_value_nums; ++i) {
+        if (i > 0) {
+            horiz_sizer->Add(FromDIP(10), 0, 0, wxEXPAND, 0);
+        }
+
+        wxBoxSizer *item_sizer;
+        item_sizer = new wxBoxSizer(wxVERTICAL);
+        m_title_texts[i] = new Label(parent, _L("Title"));
+        m_title_texts[i]->Wrap(-1);
+        m_title_texts[i]->SetFont(::Label::Body_14);
+        item_sizer->Add(m_title_texts[i], 0, wxALL, 0);
+        m_value_inputs[i] = new TextInput(parent, wxEmptyString, wxString::FromUTF8("°C"), "", wxDefaultPosition, CALIBRATION_FROM_TO_INPUT_SIZE, 0);
+        m_value_inputs[i]->GetTextCtrl()->SetValidator(wxTextValidator(wxFILTER_NUMERIC));
+        m_value_inputs[i]->GetTextCtrl()->Bind(wxEVT_TEXT, [this, i](wxCommandEvent& event) {
+            std::string number = m_value_inputs[i]->GetTextCtrl()->GetValue().ToStdString();
+            std::string decimal_point;
+            std::string expression = "^[-+]?[0-9]+([,.][0-9]+)?$";
+            std::regex decimalRegex(expression);
+            int decimal_number;
+            if (std::regex_match(number, decimalRegex)) {
+                std::smatch match;
+                if (std::regex_search(number, match, decimalRegex)) {
+                    std::string decimalPart = match[1].str();
+                    if (decimalPart != "")
+                        decimal_number = decimalPart.length() - 1;
+                    else
+                        decimal_number = 0;
+                }
+                int max_decimal_length;
+                if (i <= 1)
+                    max_decimal_length = 3;
+                else if (i >= 2)
+                    max_decimal_length = 4;
+                if (decimal_number > max_decimal_length) {
+                    int allowed_length = number.length() - decimal_number + max_decimal_length;
+                    number = number.substr(0, allowed_length);
+                    m_value_inputs[i]->GetTextCtrl()->SetValue(number);
+                    m_value_inputs[i]->GetTextCtrl()->SetInsertionPointEnd();
+                }
+            }
+            // input is not a number, invalid.
+            else
+                BOOST_LOG_TRIVIAL(trace) << "The K input string is not a valid number when calibrating. ";
+
+            });
+        item_sizer->Add(m_value_inputs[i], 0, wxALL, 0);
+        horiz_sizer->Add(item_sizer, 0, wxEXPAND, 0);
+    }
+
+    m_top_sizer->Add(horiz_sizer, 0, wxEXPAND, 0);
+}
+
+
+CaliPresetTipsPanel::CaliPresetTipsPanel(
+    wxWindow* parent,
+    wxWindowID id,
+    const wxPoint& pos,
+    const wxSize& size,
+    long style)
+    : wxPanel(parent, id, pos, size, style)
+{
+    this->SetBackgroundColour(wxColour(238, 238, 238));
+    this->SetMinSize(wxSize(MIN_CALIBRATION_PAGE_WIDTH, -1));
+
+    m_top_sizer = new wxBoxSizer(wxVERTICAL);
+
+    create_panel(this);
+
+    this->SetSizer(m_top_sizer);
+    m_top_sizer->Fit(this);
+}
+
+void CaliPresetTipsPanel::create_panel(wxWindow* parent)
+{
+    m_top_sizer->AddSpacer(FromDIP(10));
+
+    auto preset_panel_tips = new Label(parent, _L("A test model will be printed. Please clear the build plate and place it back to the hot bed before calibration."));
+    preset_panel_tips->SetFont(Label::Body_14);
+    preset_panel_tips->Wrap(CALIBRATION_TEXT_MAX_LENGTH * 1.5f);
+    m_top_sizer->Add(preset_panel_tips, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(20));
+
+    m_top_sizer->AddSpacer(FromDIP(10));
+
+    auto info_sizer = new wxFlexGridSizer(0, 3, 0, FromDIP(10));
+    info_sizer->SetFlexibleDirection(wxBOTH);
+    info_sizer->SetNonFlexibleGrowMode(wxFLEX_GROWMODE_SPECIFIED);
+
+    auto nozzle_temp_sizer = new wxBoxSizer(wxVERTICAL);
+    auto nozzle_temp_text = new Label(parent, _L("Nozzle temperature"));
+    nozzle_temp_text->SetFont(Label::Body_12);
+    m_nozzle_temp = new TextInput(parent, wxEmptyString, wxString::FromUTF8("°C"), "", wxDefaultPosition, CALIBRATION_FROM_TO_INPUT_SIZE, wxTE_READONLY);
+    m_nozzle_temp->SetBorderWidth(0);
+    nozzle_temp_sizer->Add(nozzle_temp_text, 0, wxALIGN_LEFT);
+    nozzle_temp_sizer->Add(m_nozzle_temp, 0, wxEXPAND);
+    nozzle_temp_text->Hide();
+    m_nozzle_temp->Hide();
+
+    auto bed_temp_sizer = new wxBoxSizer(wxHORIZONTAL);
+    auto printing_param_text = new Label(parent, _L("Printing Parameters"));
+    printing_param_text->SetFont(Label::Head_12);
+    printing_param_text->Wrap(CALIBRATION_TEXT_MAX_LENGTH);
+    bed_temp_sizer->Add(printing_param_text, 0, wxALIGN_CENTER | wxRIGHT, FromDIP(20));
+    auto bed_temp_text = new Label(parent, _L("Bed temperature"));
+    bed_temp_text->SetFont(Label::Body_12);
+
+    m_bed_temp = new Label(parent, wxString::FromUTF8("- °C"));
+    m_bed_temp->SetFont(Label::Body_12);
+    bed_temp_sizer->Add(bed_temp_text, 0, wxALIGN_CENTER | wxRIGHT, FromDIP(10));
+    bed_temp_sizer->Add(m_bed_temp, 0, wxALIGN_CENTER);
+
+    auto max_flow_sizer = new wxBoxSizer(wxVERTICAL);
+    auto max_flow_text = new Label(parent, _L("Max volumetric speed"));
+    max_flow_text->SetFont(Label::Body_12);
+    m_max_volumetric_speed = new TextInput(parent, wxEmptyString, wxString::FromUTF8("mm³"), "", wxDefaultPosition, CALIBRATION_FROM_TO_INPUT_SIZE, wxTE_READONLY);
+    m_max_volumetric_speed->SetBorderWidth(0);
+    max_flow_sizer->Add(max_flow_text, 0, wxALIGN_LEFT);
+    max_flow_sizer->Add(m_max_volumetric_speed, 0, wxEXPAND);
+    max_flow_text->Hide();
+    m_max_volumetric_speed->Hide();
+
+    m_nozzle_temp->GetTextCtrl()->Bind(wxEVT_SET_FOCUS, [](auto&) {});
+    m_max_volumetric_speed->GetTextCtrl()->Bind(wxEVT_SET_FOCUS, [](auto&) {});
+
+    info_sizer->Add(nozzle_temp_sizer);
+    info_sizer->Add(bed_temp_sizer);
+    info_sizer->Add(max_flow_sizer);
+    m_top_sizer->Add(info_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(20));
+
+    m_top_sizer->AddSpacer(FromDIP(10));
+}
+
+void CaliPresetTipsPanel::set_params(int nozzle_temp, int bed_temp, float max_volumetric)
+{
+    wxString text_nozzle_temp = wxString::Format("%d", nozzle_temp);
+    m_nozzle_temp->GetTextCtrl()->SetValue(text_nozzle_temp);
+
+    std::string bed_temp_text = bed_temp==0 ? "-": std::to_string(bed_temp);
+    m_bed_temp->SetLabel(wxString::FromUTF8(bed_temp_text + "°C"));
+
+    wxString flow_val_text = wxString::Format("%0.2f", max_volumetric);
+    m_max_volumetric_speed->GetTextCtrl()->SetValue(flow_val_text);
+}
+
+void CaliPresetTipsPanel::get_params(int& nozzle_temp, int& bed_temp, float& max_volumetric)
+{
+    try {
+        nozzle_temp = stoi(m_nozzle_temp->GetTextCtrl()->GetValue().ToStdString());
+    }
+    catch (...) {
+        BOOST_LOG_TRIVIAL(warning) << current_exception_message();
+        nozzle_temp = 0;
+    }
+    try {
+        bed_temp = stoi(m_bed_temp->GetLabel().ToStdString());
+    }
+    catch (...) {
+        BOOST_LOG_TRIVIAL(warning) << current_exception_message();
+        bed_temp = 0;
+    }
+    try {
+        max_volumetric = stof(m_max_volumetric_speed->GetTextCtrl()->GetValue().ToStdString());
+    }
+    catch (...) {
+        BOOST_LOG_TRIVIAL(warning) << current_exception_message();
+        max_volumetric = 0.0f;
+    }
+}
+
+CalibrationPresetPage::CalibrationPresetPage(
+    wxWindow* parent,
+    CalibMode cali_mode,
+    bool custom_range,
+    wxWindowID id,
+    const wxPoint& pos,
+    const wxSize& size,
+    long style)
+    : CalibrationWizardPage(parent, id, pos, size, style)
+    , m_show_custom_range(custom_range)
+{
+    SetBackgroundColour(*wxWHITE);
+
+    m_cali_mode = cali_mode;
+    m_page_type = CaliPageType::CALI_PAGE_PRESET;
+    m_cali_filament_mode = CalibrationFilamentMode::CALI_MODEL_SINGLE;
+    m_top_sizer = new wxBoxSizer(wxVERTICAL);
+    m_extruder_nozzle_types.resize(2, NozzleVolumeType::nvtHighFlow);
+
+    create_page(this);
+
+    this->SetSizer(m_top_sizer);
+    m_top_sizer->Fit(this);
+}
+
+void CalibrationPresetPage::msw_rescale()
+{
+    CalibrationWizardPage::msw_rescale();
+    m_ams_sync_button->msw_rescale();
+    for (auto& comboBox : m_filament_comboBox_list) {
+        comboBox->msw_rescale();
+    }
+    for (auto& comboBox : m_rack_filament_comboBox_list) {
+        comboBox->msw_rescale();
+    }
+
+    for (AMSPreview *ams_item : m_main_ams_preview_list)
+        ams_item->msw_rescale();
+    for (AMSPreview *ams_item : m_deputy_ams_preview_list)
+        ams_item->msw_rescale();
+    for (AMSPreview *ams_item : m_single_ams_preview_list)
+        ams_item->msw_rescale();
+
+    m_cali_stage_panel->msw_rescale();
+    m_custom_range_panel->msw_rescale();
+
+    // Popup last: an open one re-anchors to the sub-AMS panel, so the page must be laid out first.
+    if (m_shared_subams_popup) {
+        Layout();
+        m_shared_subams_popup->msw_rescale();
+    }
+}
+
+void CalibrationPresetPage::on_sys_color_changed()
+{
+    CalibrationWizardPage::on_sys_color_changed();
+    m_ams_sync_button->msw_rescale();
+
+    for (auto& comboBox : m_filament_comboBox_list) {
+        comboBox->msw_rescale();
+    }
+    for (auto& comboBox : m_main_filament_comboBox_list) {
+        comboBox->msw_rescale();
+    }
+    for (auto& comboBox : m_deputy_filament_comboBox_list) {
+        comboBox->msw_rescale();
+    }
+    for (auto& comboBox : m_rack_filament_comboBox_list) {
+        comboBox->msw_rescale();
+    }
+}
+
+void CalibrationPresetPage::create_selection_panel(wxWindow* parent)
+{
+    auto panel_sizer = new wxBoxSizer(wxVERTICAL);
+
+    auto sync_button_sizer = new wxBoxSizer(wxHORIZONTAL);
+    m_btn_sync = new Button(parent, "", "ams_nozzle_sync");
+    m_btn_sync->SetToolTip(_L("Synchronize nozzle and AMS information"));
+    m_btn_sync->SetCornerRadius(8);
+    StateColor btn_sync_bg_col(std::pair<wxColour, int>(wxColour("#CECECE"), StateColor::Pressed),
+                               std::pair<wxColour, int>(wxColour("#F8F8F8"), StateColor::Hovered),
+                               std::pair<wxColour, int>(wxColour("#F8F8F8"), StateColor::Normal));
+    StateColor btn_sync_bd_col(std::pair<wxColour, int>(wxColour("#00AE42"), StateColor::Pressed),
+                               std::pair<wxColour, int>(wxColour("#00AE42"), StateColor::Hovered),
+                               std::pair<wxColour, int>(wxColour("#EEEEEE"), StateColor::Normal));
+    m_btn_sync->SetBackgroundColor(btn_sync_bg_col);
+    m_btn_sync->SetBorderColor(btn_sync_bd_col);
+    m_btn_sync->SetCanFocus(false);
+    m_btn_sync->SetPaddingSize({FromDIP(6), FromDIP(12)});
+    m_btn_sync->SetMinSize(SYNC_BUTTON_SIZE);
+    m_btn_sync->SetMaxSize(SYNC_BUTTON_SIZE);
+    m_btn_sync->SetVertical();
+    m_btn_sync->Bind(wxEVT_BUTTON, [this](wxCommandEvent &e) {
+        if (!curr_obj) {
+            MessageDialog msg_dlg(nullptr, _L("Please connect the printer first before synchronizing."), wxEmptyString, wxICON_WARNING | wxOK);
+            msg_dlg.ShowModal();
+            return;
+        }
+        BOOST_LOG_TRIVIAL(info) << "CalibrationPresetPage: sync_nozzle_info - machine object status: " << KV(log_key::dev_id, curr_obj->get_dev_id())
+                                << "print_type = " << curr_obj->printer_type << ", printer_status = " << curr_obj->print_status
+                                << ", cali_finished = " << curr_obj->GetCalib()->GetStashCalibFinished() << ", cali_version = "
+                                << curr_obj->GetCalib()->GetCalibVersion() << ", cache_flow_ratio = " << curr_obj->GetCalib()->GetStashFlowRatio()
+                                << ", sub_task_name = " << curr_obj->subtask_name << ", gcode_file_name = " << curr_obj->m_gcode_file;
+
+        for (const CaliPresetInfo &preset_info : curr_obj->GetCalib()->GetSelectedCalibPreset()) {
+            BOOST_LOG_TRIVIAL(info) << "CalibrationPresetPage: sync_nozzle_info - selected preset: " << KV(log_key::tray_id, preset_info.tray_id)
+                                    << "nozzle_diameter = " << preset_info.nozzle_diameter << " " << KV(log_key::filament_id, preset_info.filament_id)
+                                    << "settring_id = " << preset_info.setting_id << ", name = " << preset_info.name;
+        }
+
+        for (const auto& extruder : curr_obj->GetExtderSystem()->GetExtruders()) {
+            if (extruder.GetNozzleType() == NozzleType::ntUndefine) {
+                if(extruder.GetExtId() == MAIN_EXTRUDER_ID) {
+                    auto rack = curr_obj->GetNozzleRack();
+                    if( rack && rack->IsSupported() && rack->GetRackNozzles().size() > 0) {
+                        continue;
+                    }
+                }
+
+                wxString name = _L(DevPrinterConfigUtil::get_toolhead_display_name(curr_obj->printer_type, extruder.GetExtId(), ToolHeadComponent::Extruder, ToolHeadNameCase::LowerCase, true));
+                wxString msg = wxString::Format(_L("Printer %s nozzle information has not been set. Please configure it before proceeding with the calibration."), name);
+                MessageDialog msg_dlg(nullptr, msg, wxEmptyString, wxICON_WARNING | wxOK);
+                msg_dlg.ShowModal();
+                break;
+            }
+        }
+        on_device_connected(curr_obj);
+    });
+
+    m_sync_button_text = new Label(parent, _L("AMS and nozzle information are synced"));
+    m_sync_button_text->SetFont(Label::Head_14);
+    m_sync_button_text->Wrap(-1);
+    sync_button_sizer->Add(m_btn_sync);
+    sync_button_sizer->AddSpacer(FromDIP(20));
+    sync_button_sizer->Add(m_sync_button_text, 0, wxALIGN_CENTER_VERTICAL | wxALL, 0);
+    panel_sizer->Add(sync_button_sizer);
+    panel_sizer->AddSpacer(PRESET_GAP);
+
+    // single extruder
+    {
+        m_single_nozzle_info_panel = new wxPanel(parent);
+        m_single_nozzle_info_panel->SetBackgroundColour(*wxWHITE);
+        auto single_nozzle_sizer = new wxBoxSizer(wxVERTICAL);
+        auto nozzle_combo_text = new Label(m_single_nozzle_info_panel, _L("Nozzle Diameter"));
+        nozzle_combo_text->SetFont(Label::Head_14);
+        nozzle_combo_text->Wrap(-1);
+
+        single_nozzle_sizer->Add(nozzle_combo_text, 0, wxALL, 0);
+        single_nozzle_sizer->AddSpacer(FromDIP(10));
+        m_comboBox_nozzle_dia = new ComboBox(m_single_nozzle_info_panel, wxID_ANY, "", wxDefaultPosition, CALIBRATION_COMBOX_SIZE, 0, nullptr, wxCB_READONLY);
+        single_nozzle_sizer->Add(m_comboBox_nozzle_dia, 0, wxALL, 0);
+
+        m_nozzle_diameter_tips = new Label(m_single_nozzle_info_panel, "");
+        m_nozzle_diameter_tips->Hide();
+        m_nozzle_diameter_tips->SetFont(Label::Body_13);
+        // m_nozzle_diameter_tips->SetForegroundColour(wxColour(100, 100, 100));
+        m_nozzle_diameter_tips->Wrap(CALIBRATION_TEXT_MAX_LENGTH);
+        single_nozzle_sizer->Add(m_nozzle_diameter_tips, 0, wxALL, 0);
+        single_nozzle_sizer->AddSpacer(PRESET_GAP);
+
+        auto nozzle_volume_type_text = new Label(m_single_nozzle_info_panel, _L("Nozzle Flow"));
+        nozzle_volume_type_text->SetFont(Label::Head_14);
+        nozzle_volume_type_text->Wrap(-1);
+
+        m_comboBox_nozzle_volume = new ComboBox(m_single_nozzle_info_panel, wxID_ANY, "", wxDefaultPosition, CALIBRATION_COMBOX_SIZE, 0, nullptr, wxCB_READONLY);
+        m_comboBox_nozzle_volume->Disable();
+
+        single_nozzle_sizer->Add(nozzle_volume_type_text, 0, wxALL, 0);
+        single_nozzle_sizer->AddSpacer(FromDIP(5));
+        single_nozzle_sizer->Add(m_comboBox_nozzle_volume, 0, wxALL, 0);
+        single_nozzle_sizer->AddSpacer(FromDIP(5));
+        single_nozzle_sizer->AddSpacer(PRESET_GAP);
+
+        m_single_nozzle_info_panel->SetSizer(single_nozzle_sizer);
+        panel_sizer->Add(m_single_nozzle_info_panel);
+    }
+
+    // multi extruder
+    {
+        m_multi_nozzle_info_panel = new wxPanel(parent);
+        m_multi_nozzle_info_panel->SetBackgroundColour(*wxWHITE);
+        auto nozzle_volume_sizer = new wxBoxSizer(wxVERTICAL);
+        auto nozzle_info_text = new Label(m_multi_nozzle_info_panel, _L("Nozzle Info"));
+        nozzle_info_text->SetFont(Label::Head_14);
+        nozzle_info_text->Wrap(-1);
+        nozzle_volume_sizer->Add(nozzle_info_text, 0, wxALL, 0);
+        //nozzle_volume_sizer->AddSpacer(FromDIP(10));
+
+        wxBoxSizer *      type_sizer  = new wxBoxSizer(wxHORIZONTAL);
+        std::string cwp_pt = curr_obj ? curr_obj->printer_type : wxGetApp().preset_bundle->printers.get_edited_preset().get_printer_type(wxGetApp().preset_bundle);
+        m_left_nozzle_volume_type_sizer  = new wxStaticBoxSizer(wxVERTICAL, m_multi_nozzle_info_panel, _L(DevPrinterConfigUtil::get_toolhead_display_name(cwp_pt, DEPUTY_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::TitleCase)));
+        {
+            //wxBoxSizer *nozzle_diameter_sizer = new wxBoxSizer(wxHORIZONTAL);
+            auto        nozzle_diameter_text  = new Label(m_multi_nozzle_info_panel, _L("Nozzle Diameter"));
+            nozzle_diameter_text->SetFont(Label::Head_14);
+            nozzle_diameter_text->Wrap(-1);
+
+            m_left_comboBox_nozzle_dia = new ComboBox(m_multi_nozzle_info_panel, wxID_ANY, "", wxDefaultPosition, CALIBRATION_FILAMENT_COMBOX_SIZE, 0, nullptr, wxCB_READONLY);
+            m_left_comboBox_nozzle_dia->Disable();
+
+            m_left_nozzle_volume_type_sizer->AddSpacer(FromDIP(5));
+            m_left_nozzle_volume_type_sizer->Add(nozzle_diameter_text, 0, wxLEFT | wxRIGHT, 10);
+            m_left_nozzle_volume_type_sizer->AddSpacer(FromDIP(5));
+            m_left_nozzle_volume_type_sizer->Add(m_left_comboBox_nozzle_dia, 0, wxLEFT | wxRIGHT, 10);
+            m_left_nozzle_volume_type_sizer->AddSpacer(FromDIP(5));
+
+            //wxBoxSizer *nozzle_volume_sizer   = new wxBoxSizer(wxHORIZONTAL);
+            auto        nozzle_volume_type_text = new Label(m_multi_nozzle_info_panel, _L("Nozzle Flow"));
+            nozzle_volume_type_text->SetFont(Label::Head_14);
+            nozzle_volume_type_text->Wrap(-1);
+
+            m_left_comboBox_nozzle_volume = new ComboBox(m_multi_nozzle_info_panel, wxID_ANY, "", wxDefaultPosition, CALIBRATION_FILAMENT_COMBOX_SIZE, 0, nullptr, wxCB_READONLY);
+            m_left_comboBox_nozzle_volume->Disable();
+
+            m_left_nozzle_volume_type_sizer->Add(nozzle_volume_type_text, 0, wxLEFT | wxRIGHT, 10);
+            m_left_nozzle_volume_type_sizer->AddSpacer(FromDIP(5));
+            m_left_nozzle_volume_type_sizer->Add(m_left_comboBox_nozzle_volume, 0, wxLEFT | wxRIGHT, 10);
+            m_left_nozzle_volume_type_sizer->AddSpacer(FromDIP(5));
+
+            //m_left_nozzle_volume_type_sizer->Add(nozzle_diameter_sizer);
+            //m_left_nozzle_volume_type_sizer->AddSpacer(FromDIP(5));
+            //m_left_nozzle_volume_type_sizer->Add(nozzle_volume_sizer);
+        }
+
+        m_right_nozzle_volume_type_sizer = new wxStaticBoxSizer(wxVERTICAL, m_multi_nozzle_info_panel, _L(DevPrinterConfigUtil::get_toolhead_display_name(cwp_pt, MAIN_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::TitleCase)));
+        {
+            //wxBoxSizer *nozzle_diameter_sizer = new wxBoxSizer(wxHORIZONTAL);
+            auto        nozzle_diameter_text  = new Label(m_multi_nozzle_info_panel, _L("Nozzle Diameter"));
+            nozzle_diameter_text->SetFont(Label::Head_14);
+            nozzle_diameter_text->Wrap(-1);
+
+            m_right_comboBox_nozzle_dia = new ComboBox(m_multi_nozzle_info_panel, wxID_ANY, "", wxDefaultPosition, CALIBRATION_FILAMENT_COMBOX_SIZE, 0, nullptr, wxCB_READONLY);
+            m_right_comboBox_nozzle_dia->Bind(wxEVT_COMMAND_COMBOBOX_SELECTED, &CalibrationPresetPage::on_select_nozzle, this);
+            m_right_comboBox_nozzle_dia->Disable();
+
+            m_right_nozzle_volume_type_sizer->AddSpacer(FromDIP(5));
+            m_right_nozzle_volume_type_sizer->Add(nozzle_diameter_text, 0, wxLEFT | wxRIGHT, 10);
+            m_right_nozzle_volume_type_sizer->AddSpacer(FromDIP(5));
+            m_right_nozzle_volume_type_sizer->Add(m_right_comboBox_nozzle_dia, 0, wxLEFT | wxRIGHT, 10);
+            m_right_nozzle_volume_type_sizer->AddSpacer(FromDIP(5));
+
+            //wxBoxSizer *nozzle_volume_sizer     = new wxBoxSizer(wxHORIZONTAL);
+            auto        nozzle_volume_type_text = new Label(m_multi_nozzle_info_panel, _L("Nozzle Flow"));
+            nozzle_volume_type_text->SetFont(Label::Head_14);
+            nozzle_volume_type_text->Wrap(-1);
+
+            m_right_comboBox_nozzle_volume = new ComboBox(m_multi_nozzle_info_panel, wxID_ANY, "", wxDefaultPosition, CALIBRATION_FILAMENT_COMBOX_SIZE, 0, nullptr, wxCB_READONLY);
+            m_right_comboBox_nozzle_volume->Bind(wxEVT_COMMAND_COMBOBOX_SELECTED, &CalibrationPresetPage::on_select_nozzle, this);
+            m_right_comboBox_nozzle_volume->Disable();
+
+            m_right_nozzle_volume_type_sizer->Add(nozzle_volume_type_text, 0, wxLEFT | wxRIGHT, 10);
+            m_right_nozzle_volume_type_sizer->AddSpacer(FromDIP(5));
+            m_right_nozzle_volume_type_sizer->Add(m_right_comboBox_nozzle_volume, 0, wxLEFT | wxRIGHT, 10);
+            m_right_nozzle_volume_type_sizer->AddSpacer(FromDIP(5));
+
+            //m_right_nozzle_volume_type_sizer->Add(nozzle_diameter_sizer);
+            //m_right_nozzle_volume_type_sizer->AddSpacer(FromDIP(5));
+            //m_right_nozzle_volume_type_sizer->Add(nozzle_volume_sizer);
+        }
+
+        type_sizer->Add(m_left_nozzle_volume_type_sizer, 1, wxEXPAND | wxRIGHT, 10);
+        type_sizer->Add(m_right_nozzle_volume_type_sizer, 1, wxEXPAND, 0);
+
+        nozzle_volume_sizer->Add(type_sizer);
+        nozzle_volume_sizer->AddSpacer(PRESET_GAP);
+
+        m_multi_nozzle_info_panel->SetSizer(nozzle_volume_sizer);
+        panel_sizer->Add(m_multi_nozzle_info_panel);
+
+        m_multi_nozzle_info_panel->Hide();
+    }
+
+    auto plate_type_combo_text = new Label(parent, _L("Plate Type"));
+    plate_type_combo_text->SetFont(Label::Head_14);
+    plate_type_combo_text->Wrap(-1);
+    panel_sizer->Add(plate_type_combo_text, 0, wxALL, 0);
+    panel_sizer->AddSpacer(FromDIP(10));
+    m_comboBox_bed_type = new ComboBox(parent, wxID_ANY, "", wxDefaultPosition, CALIBRATION_COMBOX_SIZE, 0, nullptr, wxCB_READONLY);
+    panel_sizer->Add(m_comboBox_bed_type, 0, wxALL, 0);
+
+    panel_sizer->AddSpacer(PRESET_GAP);
+
+    m_filament_from_panel = new wxPanel(parent);
+    m_filament_from_panel->Hide();
+    auto filament_from_sizer = new wxBoxSizer(wxVERTICAL);
+    auto filament_from_text = new Label(m_filament_from_panel, _L("filament position"));
+    filament_from_text->SetFont(Label::Head_14);
+    filament_from_sizer->Add(filament_from_text, 0);
+
+    m_filament_from_panel->SetSizer(filament_from_sizer);
+    panel_sizer->Add(m_filament_from_panel, 0, wxBOTTOM, PRESET_GAP);
+
+    auto filament_for_title_sizer = new wxBoxSizer(wxHORIZONTAL);
+    auto filament_for_text = new Label(parent, _L("Filament For Calibration"));
+    filament_for_text->SetFont(Label::Head_14);
+    filament_for_title_sizer->Add(filament_for_text, 0, wxALIGN_CENTER);
+    filament_for_title_sizer->AddSpacer(FromDIP(25));
+    m_ams_sync_button = new ScalableButton(parent, wxID_ANY, "ams_fila_sync", wxEmptyString, wxDefaultSize, wxDefaultPosition, wxBU_EXACTFIT | wxNO_BORDER, false, 18);
+    m_ams_sync_button->SetBackgroundColour(*wxWHITE);
+    m_ams_sync_button->SetToolTip(_L("Synchronize filament list from AMS"));
+    filament_for_title_sizer->Add(m_ams_sync_button, 0, wxALIGN_CENTER);
+    panel_sizer->Add(filament_for_title_sizer);
+    panel_sizer->AddSpacer(FromDIP(6));
+
+    parent->SetSizer(panel_sizer);
+    panel_sizer->Fit(parent);
+
+    m_ams_sync_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent& e) {
+        sync_ams_info(curr_obj);
+    });
+
+    m_comboBox_nozzle_dia->Bind(wxEVT_COMBOBOX, &CalibrationPresetPage::on_select_nozzle, this);
+
+    m_comboBox_bed_type->Bind(wxEVT_COMBOBOX, &CalibrationPresetPage::on_select_plate_type, this);
+}
+
+static std::vector<NozzleDiameterType> nozzle_diameters = {
+    NozzleDiameterType::NOZZLE_DIAMETER_0_2,
+    NozzleDiameterType::NOZZLE_DIAMETER_0_4,
+    NozzleDiameterType::NOZZLE_DIAMETER_0_6,
+    NozzleDiameterType::NOZZLE_DIAMETER_0_8,
+};
+
+void CalibrationPresetPage::init_selection_values()
+{
+    // init nozzle diameter and nozzle volume
+    {
+        m_comboBox_nozzle_dia->Clear();
+        for (auto diameter : nozzle_diameters) {
+            m_comboBox_nozzle_dia->Append(wxString::Format("%1.1f mm", DevNozzle::ToNozzleDiameterFloat(diameter)), wxNullBitmap, new int{diameter});
+        }
+        switch_combox_to_target(m_comboBox_nozzle_dia, NozzleDiameterType::NOZZLE_DIAMETER_0_4);
+
+        m_comboBox_nozzle_volume->Clear();
+
+        auto volume_diamters_map = CalibUtils::get_supported_nozzle_volume_and_diameters(curr_obj);
+        for(const auto & [volume_type, diameters] : volume_diamters_map) {
+            m_comboBox_nozzle_volume->Append(DevNozzle::GetNozzleVolumeTypeStr(volume_type), wxNullBitmap, new int{volume_type});
+        }
+
+        switch_combox_to_target(m_comboBox_nozzle_volume, NozzleVolumeType::nvtStandard);
+    }
+
+    Preset* cur_printer_preset = get_printer_preset(curr_obj, 0.4);
+
+    m_comboBox_bed_type->Clear();
+    m_displayed_bed_types.clear();
+
+    // init plate type
+    int curr_selection = 0;
+    const ConfigOptionDef* bed_type_def = print_config_def.get("curr_bed_type");
+    if (bed_type_def && bed_type_def->enum_keys_map) {
+        int select_index = 0;
+        int bed_type_value = 0;
+        for (auto item : bed_type_def->enum_labels) {
+            bed_type_value++;
+            if (cur_printer_preset) {
+                const VendorProfile::PrinterModel *pm = PresetUtils::system_printer_model(*cur_printer_preset);
+                if (pm) {
+                    bool find = std::find(pm->not_support_bed_types.begin(), pm->not_support_bed_types.end(), item) != pm->not_support_bed_types.end();
+                    if (find) {
+                        continue;
+                    }
+                }
+            }
+
+            if (item == "Textured PEI Plate") {
+                curr_selection = select_index;
+            }
+
+            m_comboBox_bed_type->AppendString(_L(item));
+            m_displayed_bed_types.emplace_back(BedType(bed_type_value));
+            select_index++;
+        }
+        m_comboBox_bed_type->SetSelection(curr_selection);
+    }
+
+    // left
+    {
+        m_left_comboBox_nozzle_dia->Clear();
+        for (auto diameter : nozzle_diameters) {
+            m_left_comboBox_nozzle_dia->Append(wxString::Format("%1.1f mm", DevNozzle::ToNozzleDiameterFloat(diameter)), wxNullBitmap, new int{diameter});
+        }
+        switch_combox_to_target(m_left_comboBox_nozzle_dia, NozzleDiameterType::NOZZLE_DIAMETER_0_4);
+
+        m_left_comboBox_nozzle_volume->Clear();
+
+        auto volume_diameters_map = CalibUtils::get_supported_nozzle_volume_and_diameters(curr_obj);
+        for(const auto & [volume_type, diameters] : volume_diameters_map) {
+            m_left_comboBox_nozzle_volume->Append(DevNozzle::GetNozzleVolumeTypeStr(volume_type), wxNullBitmap, new int{volume_type});
+        }
+
+        switch_combox_to_target(m_left_comboBox_nozzle_volume, NozzleVolumeType::nvtStandard);
+    }
+
+    // right
+    {
+        m_right_comboBox_nozzle_dia->Clear();
+        for (auto diameter : nozzle_diameters) {
+            m_right_comboBox_nozzle_dia->Append(wxString::Format("%1.1f mm", DevNozzle::ToNozzleDiameterFloat(diameter)), wxNullBitmap, new int{diameter});
+        }
+        switch_combox_to_target(m_right_comboBox_nozzle_dia, NozzleDiameterType::NOZZLE_DIAMETER_0_4);
+
+        m_right_comboBox_nozzle_volume->Clear();
+
+        auto volume_diameters_map = CalibUtils::get_supported_nozzle_volume_and_diameters(curr_obj);
+        for(const auto & [volume_type, diameters] : volume_diameters_map) {
+            m_right_comboBox_nozzle_volume->Append(DevNozzle::GetNozzleVolumeTypeStr(volume_type), wxNullBitmap, new int{volume_type});
+        }
+
+        switch_combox_to_target(m_right_comboBox_nozzle_volume, NozzleVolumeType::nvtStandard);
+    }
+}
+
+
+void CalibrationPresetPage::init_filament_list_tips(){
+    std::string pt = curr_obj ? curr_obj->printer_type :
+        wxGetApp().preset_bundle->printers.get_edited_preset().get_printer_type(wxGetApp().preset_bundle);
+    wxString main_nozzle_name = _L(DevPrinterConfigUtil::get_toolhead_display_name(pt, MAIN_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::TitleCase));
+    wxString deputy_nozzle_name = _L(DevPrinterConfigUtil::get_toolhead_display_name(pt, DEPUTY_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::TitleCase));
+    m_tips_map["base"] = std::make_pair(true, _L("Tips for calibration material: \n- Materials that can share same hot bed temperature\n- Different filament brand and family(Brand = Bambu, Family = Basic, Matte)\n"));
+    m_tips_map["bowden_right"] = std::make_pair(false, wxString::Format("- %s " + _L("(Aux) does not support automatic flow calibration."), main_nozzle_name));
+    m_tips_map["bowden_left"] = std::make_pair(false, wxString::Format("- %s " + _L("(Aux) does not support automatic flow calibration."), deputy_nozzle_name));
+    m_tips_map["rack"] = std::make_pair(false, _L("- Note: The hotend's number is tied to the holder. When the hotend is moved to a new holder, its number will update automatically.\n"));
+}
+
+wxString CalibrationPresetPage::get_filament_tips(){
+    wxString tips;
+    for(auto &item : m_tips_map){
+        if(item.second.first){
+            tips += item.second.second;
+        }
+    }
+    return tips;
+}
+
+void CalibrationPresetPage::create_filament_list_panel(wxWindow* parent)
+{
+    auto panel_sizer = new wxBoxSizer(wxVERTICAL);
+
+    init_filament_list_tips();
+
+    m_filament_list_tips = new Label(parent, get_filament_tips());
+    m_filament_list_tips->Hide();
+    m_filament_list_tips->SetFont(Label::Body_13);
+    m_filament_list_tips->SetForegroundColour(wxColour(145, 145, 145));
+    m_filament_list_tips->Wrap(CALIBRATION_TEXT_MAX_LENGTH);
+    panel_sizer->Add(m_filament_list_tips, 0, wxBOTTOM, FromDIP(10));
+
+    // Preview item
+    m_single_ams_preview_panel = new wxPanel(parent);
+    panel_sizer->Add(m_single_ams_preview_panel);
+
+    m_single_ams_items_panel   = new wxPanel(parent);
+    m_single_ams_items_panel->SetSizer(create_slot_items_sizer(m_single_ams_items_panel, m_filament_comboBox_list, ExtruderRole::SINGLE_EXTRUDER));
+
+    // set default selelected
+    m_filament_comboBox_list[0]->GetRadioBox()->SetValue(true);
+
+    panel_sizer->Add(m_single_ams_items_panel, 0);
+
+    parent->SetSizer(panel_sizer);
+    panel_sizer->Fit(parent);
+}
+
+float CalibrationPresetPage::get_nozzle_diameter(int nozzle_pos_id) const
+{
+    float nozzle_dia = -1.f;
+    if (!curr_obj)
+        return nozzle_dia;
+
+    // Rack nozzle codes use the 0x10+ range (see MachineObject::get_nozzle_by_id_code); the single
+    // top combo can't represent per-slot diameters, so read the actual nozzle. Extruder ids 0/1
+    // (== MAIN/DEPUTY_EXTRUDER_ID) keep the UI-combo value used by sync check / X1 / flow / preset.
+    if (nozzle_pos_id >= 0x10)
+        return curr_obj->get_nozzle_by_id_code(nozzle_pos_id).GetNozzleDiameter();
+
+    if (curr_obj->is_multi_extruders()) {
+        if (nozzle_pos_id == LEFT_EXTRUDER_ID) {
+            auto sel = m_left_comboBox_nozzle_dia->GetSelection();
+            if(sel != wxNOT_FOUND) {
+                NozzleDiameterType diameter = NozzleDiameterType(*(int*)m_left_comboBox_nozzle_dia->GetClientData(sel));
+                nozzle_dia = DevNozzle::ToNozzleDiameterFloat(diameter);
+            }
+        } else if (nozzle_pos_id == RIGHT_EXTRUDER_ID) {
+            auto sel = m_right_comboBox_nozzle_dia->GetSelection();
+            if(sel != wxNOT_FOUND) {
+                NozzleDiameterType diameter = NozzleDiameterType(*(int*)m_right_comboBox_nozzle_dia->GetClientData(sel));
+                nozzle_dia = DevNozzle::ToNozzleDiameterFloat(diameter);
+            }
+        }
+    }
+    else if (m_comboBox_nozzle_dia->GetSelection() != wxNOT_FOUND) {
+        auto sel = m_comboBox_nozzle_dia->GetSelection();
+        NozzleDiameterType diameter = NozzleDiameterType(*(int*)m_comboBox_nozzle_dia->GetClientData(sel));
+        nozzle_dia = DevNozzle::ToNozzleDiameterFloat(diameter);
+    }
+
+    return nozzle_dia;
+}
+
+NozzleVolumeType CalibrationPresetPage::get_nozzle_volume_type(int nozzle_pos_id) const
+{
+    if (curr_obj) {
+        auto nozzle = curr_obj->get_nozzle_by_id_code(nozzle_pos_id);
+        return DevNozzle::ToNozzleVolumeType(nozzle.GetNozzleFlowType());
+    }
+    return NozzleVolumeType::nvtStandard;
+}
+
+ExtruderType CalibrationPresetPage::get_extruder_type(int extruder_id) const
+{
+    if (curr_obj)
+        return CalibUtils::get_extruder_type(curr_obj, extruder_id);
+    return ExtruderType::etDirectDrive;
+}
+
+const std::set<std::string>& CalibrationPresetPage::get_calibrate_filament_names(const std::string& printer_preset_name)
+{
+    auto it = m_calibrate_filament_names.find(printer_preset_name);
+    if (it != m_calibrate_filament_names.end())
+        return it->second;
+
+    std::set<std::string> names;
+    PresetBundle* preset_bundle = wxGetApp().preset_bundle;
+    if (preset_bundle && !printer_preset_name.empty()) {
+        preset_bundle->set_calibrate_printer(printer_preset_name);
+        for (const Preset* preset : preset_bundle->calibrate_filaments)
+            names.insert(preset->name);
+    }
+    return m_calibrate_filament_names.emplace(printer_preset_name, std::move(names)).first->second;
+}
+
+wxSizer* CalibrationPresetPage::create_ams_items_sizer(wxPanel* ams_preview_panel, std::vector<AMSPreview*> &ams_preview_list, std::vector<AMSinfo> &ams_info, ExtruderRole role){
+    /* clear ams_preview_list */
+    for (auto &item : ams_preview_list) {
+        delete item;
+    }
+    ams_preview_list.clear();
+
+    /* create ams_preview_list */
+    auto ams_items_sizer = new wxBoxSizer(wxHORIZONTAL);
+    for (auto &info : ams_info) {
+        auto preview_ams_item = new AMSPreview(ams_preview_panel, wxID_ANY, info);
+        preview_ams_item->Update(info);
+        preview_ams_item->Open();
+        ams_preview_list.push_back(preview_ams_item);
+        std::string ams_id = preview_ams_item->get_ams_id();
+        preview_ams_item->Bind(wxEVT_LEFT_DOWN, [this, ams_id, role](wxMouseEvent &e) {
+            update_extruder_filament_combobox(role, ams_id);
+            e.Skip();
+        });
+        ams_items_sizer->Add(preview_ams_item, 0, wxALIGN_CENTER | wxRIGHT, FromDIP(6));
+    }
+    return ams_items_sizer;
+}
+
+wxSizer* CalibrationPresetPage::create_slot_items_sizer(wxPanel* slot_items_panel, FilamentComboBoxList& filament_comboBox_list, ExtruderRole extuder_role){
+    wxSizer* slot_ams_items_sizer;
+    if(extuder_role == ExtruderRole::SINGLE_EXTRUDER){
+        slot_ams_items_sizer = new wxFlexGridSizer(2, 2, FromDIP(10), CALIBRATION_FGSIZER_HGAP);
+    }else if(extuder_role == ExtruderRole::MAIN_EXTRUDER || extuder_role == ExtruderRole::DEPUTY_EXTRUDER){
+        slot_ams_items_sizer = new wxBoxSizer(wxVERTICAL);
+    }
+
+    for (int i = 0; i < MAX_SLOT_NUM; i++) { // 4 slots
+        auto           filament_comboBox_sizer = new wxBoxSizer(wxHORIZONTAL);
+
+        RadioBox *     radio_btn               = new RadioBox(slot_items_panel);
+        radio_btn->SetBackgroundColour(*wxWHITE);
+
+        CheckBox *     check_box               = new CheckBox(slot_items_panel);
+        check_box->SetBackgroundColour(*wxWHITE);
+
+        int index = extuder_role == ExtruderRole::MAIN_EXTRUDER ? (i + 4) : i;
+        FilamentComboBox *fcb = new FilamentComboBox(slot_items_panel);
+        fcb->set_index(index);
+        fcb->SetRadioBox(radio_btn);
+        fcb->SetCheckBox(check_box);
+        fcb->SetExtuderRole(extuder_role);
+        fcb->set_select_mode(CalibrationFilamentMode::CALI_MODEL_SINGLE);
+
+        filament_comboBox_sizer->Add(radio_btn, 0, wxALIGN_CENTER | wxRIGHT, FromDIP(2));
+        filament_comboBox_sizer->Add(check_box, 0, wxALIGN_CENTER | wxRIGHT, FromDIP(8));
+        filament_comboBox_sizer->Add(fcb, 0, wxALIGN_CENTER);
+        slot_ams_items_sizer->Add(filament_comboBox_sizer, 0);
+
+        fcb->Bind(EVT_CALI_TRAY_CHANGED, &CalibrationPresetPage::on_select_tray, this);
+
+        radio_btn->Bind(wxEVT_TOGGLEBUTTON, [this, fcb](wxCommandEvent &evt) {
+            /* Ensure manual calibration uses exactly one selected filament across all nozzle panels. */
+            manage_filament_radio_btn(fcb);
+
+            wxCommandEvent event(EVT_CALI_TRAY_CHANGED);
+            event.SetEventObject(this);
+            wxPostEvent(this, event);
+
+        });
+
+        check_box->Bind(wxEVT_TOGGLEBUTTON, [this](wxCommandEvent &evt) {
+            wxCommandEvent event(EVT_CALI_TRAY_CHANGED);
+            event.SetEventObject(this);
+            wxPostEvent(this, event);
+            evt.Skip();
+        });
+
+        filament_comboBox_list.emplace_back(fcb);
+    }
+    return slot_ams_items_sizer;
+}
+
+/* Fixed maximum slots for RackType_A panel; controls are statically pre-created. */
+static constexpr int MAX_RACK_SLOT_NUM = 9;
+
+wxSizer* CalibrationPresetPage::create_rack_items_sizer(wxPanel* rack_items_panel, FilamentComboBoxList& rack_filament_comboBox_list)
+{
+    auto rack_sizer = new wxBoxSizer(wxVERTICAL);
+
+    for (int i = 0; i < MAX_RACK_SLOT_NUM; ++i) {
+        auto row_sizer = new wxBoxSizer(wxHORIZONTAL);
+
+        RadioBox* radio_btn = new RadioBox(rack_items_panel);
+        radio_btn->SetBackgroundColour(*wxWHITE);
+
+        CheckBox* check_box = new CheckBox(rack_items_panel);
+        check_box->SetBackgroundColour(*wxWHITE);
+
+        FilamentExtendComboBox* fcb = new FilamentExtendComboBox(rack_items_panel, i);
+        /* model index is assigned later by assign_rack_model_indices() (after availability is known). */
+        fcb->SetRadioBox(radio_btn);
+        fcb->SetCheckBox(check_box);
+        fcb->SetExtuderRole(ExtruderRole::SINGLE_EXTRUDER);
+        fcb->set_select_mode(CalibrationFilamentMode::CALI_MODEL_SINGLE);
+
+        row_sizer->Add(radio_btn, 0, wxALIGN_CENTER | wxBOTTOM, FromDIP(4));
+        row_sizer->Add(check_box, 0, wxALIGN_CENTER | wxRIGHT, FromDIP(8));
+        row_sizer->Add(fcb, 0, wxALIGN_CENTER);
+        rack_sizer->Add(row_sizer, 0, wxBOTTOM, FromDIP(5));
+
+        fcb->Bind(EVT_CALI_TRAY_CHANGED, &CalibrationPresetPage::on_select_tray, this);
+        radio_btn->Bind(wxEVT_TOGGLEBUTTON, [this, fcb](wxCommandEvent& evt) {
+            /* Ensure manual calibration uses exactly one selected filament across all nozzle panels. */
+            manage_filament_radio_btn(fcb);
+
+            // SINGLE: clear every sub-AMS selection (data). With a single shared popup, only that one
+            // popup can hold live radio visuals, so a single ClearAllRadioVisuals() covers all slots.
+            if (m_cali_filament_mode == CalibrationFilamentMode::CALI_MODEL_SINGLE) {
+                for (auto* other : m_rack_filament_comboBox_list) {
+                    if (auto* ext = dynamic_cast<FilamentExtendComboBox*>(other)) {
+                        ext->ClearSubAmsSelection();
+                    }
+                }
+                if (m_shared_subams_popup) m_shared_subams_popup->ClearAllRadioVisuals();
+            }
+            wxCommandEvent event(EVT_CALI_TRAY_CHANGED);
+            event.SetEventObject(this);
+            wxPostEvent(this, event);
+            evt.Skip();
+        });
+        check_box->Bind(wxEVT_TOGGLEBUTTON, [this](wxCommandEvent& evt) {
+            wxCommandEvent event(EVT_CALI_TRAY_CHANGED);
+            event.SetEventObject(this);
+            wxPostEvent(this, event);
+            evt.Skip();
+        });
+
+        rack_filament_comboBox_list.push_back(fcb);
+    }
+
+    return rack_sizer;
+}
+
+void CalibrationPresetPage::manage_filament_radio_btn(FilamentComboBox* selected_fcb)
+{
+    if (!selected_fcb || !selected_fcb->GetRadioBox())
+        return;
+
+    auto update_radio_list = [selected_fcb](FilamentComboBoxList& list) {
+        for (auto &fcb : list) {
+            if (!fcb || !fcb->GetRadioBox())
+                continue;
+
+            fcb->GetRadioBox()->SetValue(fcb == selected_fcb);
+        }
+    };
+
+    /* Hidden panels are included deliberately to avoid stale selections after switching printer/nozzle modes. */
+    update_radio_list(m_filament_comboBox_list);
+    update_radio_list(m_main_filament_comboBox_list);
+    update_radio_list(m_deputy_filament_comboBox_list);
+    update_radio_list(m_rack_filament_comboBox_list);
+}
+
+void CalibrationPresetPage::create_multi_extruder_filament_list_panel(wxWindow *parent)
+{
+    m_multi_extruder_ams_panel_sizer = new wxBoxSizer(wxVERTICAL);
+
+    m_filament_list_tips = new Label(
+        parent,
+        _L("Tips for calibration material: \n- Materials that can share same hot bed temperature\n- Different filament brand and family(Brand = Bambu, Family = Basic, Matte)"));
+    m_filament_list_tips->Hide();
+    m_filament_list_tips->SetFont(Label::Body_13);
+    m_filament_list_tips->SetForegroundColour(wxColour(145, 145, 145));
+    m_filament_list_tips->Wrap(CALIBRATION_TEXT_MAX_LENGTH);
+    m_multi_extruder_ams_panel_sizer->Add(m_filament_list_tips, 0, wxBOTTOM, FromDIP(10));
+
+    {
+        m_main_filament_cali_panel = new wxPanel(parent);
+        // 1. Preview item
+        m_main_sizer              = new wxStaticBoxSizer(wxVERTICAL, m_main_filament_cali_panel, "Main");
+        m_main_ams_preview_panel  = new wxPanel(m_main_filament_cali_panel);
+        m_main_sizer->Add(m_main_ams_preview_panel);
+        m_main_filament_cali_panel->SetSizer(m_main_sizer);
+
+        // 2. AMS item
+        m_main_ams_items_panel    = new wxPanel(m_main_filament_cali_panel);
+        m_main_ams_items_panel->SetSizer(create_slot_items_sizer(m_main_ams_items_panel, m_main_filament_comboBox_list, ExtruderRole::MAIN_EXTRUDER));
+
+        // set default selelected
+        m_main_filament_comboBox_list[0]->GetRadioBox()->SetValue(true);
+
+        m_main_sizer->Add(m_main_ams_items_panel, 0, wxALL, 10);
+    }
+
+    {
+        m_deputy_filament_cali_panel = new wxPanel(parent);
+        // 1. Preview item
+        m_deputy_sizer             = new wxStaticBoxSizer(wxVERTICAL, m_deputy_filament_cali_panel, "Deputy");
+        m_deputy_ams_preview_panel = new wxPanel(m_deputy_filament_cali_panel);
+        m_deputy_sizer->Add(m_deputy_ams_preview_panel);
+        m_deputy_filament_cali_panel->SetSizer(m_deputy_sizer);
+
+        // 2. AMS item
+        m_deputy_ams_items_panel = new wxPanel(m_deputy_filament_cali_panel);
+        m_deputy_ams_items_panel->SetSizer(create_slot_items_sizer(m_deputy_ams_items_panel, m_deputy_filament_comboBox_list, ExtruderRole::DEPUTY_EXTRUDER));
+        m_deputy_sizer->Add(m_deputy_ams_items_panel, 0, wxEXPAND | wxALL, 10);
+    }
+
+    std::string cwp_pt = curr_obj ? curr_obj->printer_type : wxGetApp().preset_bundle->printers.get_edited_preset().get_printer_type(wxGetApp().preset_bundle);
+    m_multi_exturder_ams_sizer = new wxBoxSizer(wxHORIZONTAL);
+    if (m_main_extruder_on_left) {
+        m_main_sizer->GetStaticBox()->SetLabel(_L(DevPrinterConfigUtil::get_toolhead_display_name(cwp_pt, DEPUTY_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::TitleCase)));
+        m_deputy_sizer->GetStaticBox()->SetLabel(_L(DevPrinterConfigUtil::get_toolhead_display_name(cwp_pt, MAIN_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::TitleCase)));
+        m_multi_exturder_ams_sizer->Add(m_main_filament_cali_panel, 0, wxALL | wxALIGN_BOTTOM, 10);
+        m_multi_exturder_ams_sizer->Add(m_deputy_filament_cali_panel, 0, wxALL | wxALIGN_BOTTOM, 10);
+    }
+    else {
+        m_main_sizer->GetStaticBox()->SetLabel(_L(DevPrinterConfigUtil::get_toolhead_display_name(cwp_pt, MAIN_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::TitleCase)));
+        m_deputy_sizer->GetStaticBox()->SetLabel(_L(DevPrinterConfigUtil::get_toolhead_display_name(cwp_pt, DEPUTY_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::TitleCase)));
+        m_multi_exturder_ams_sizer->Add(m_deputy_filament_cali_panel, 0, wxEXPAND | wxALL | wxALIGN_BOTTOM, 10);
+        m_multi_exturder_ams_sizer->Add(m_main_filament_cali_panel, 0, wxEXPAND | wxALL | wxALIGN_BOTTOM, 10);
+    }
+    m_multi_extruder_ams_panel_sizer->Add(m_multi_exturder_ams_sizer);
+
+    parent->SetSizer(m_multi_extruder_ams_panel_sizer);
+    m_multi_extruder_ams_panel_sizer->Fit(parent);
+    // Layout();
+}
+
+void CalibrationPresetPage::create_page(wxWindow* parent)
+{
+    m_page_caption = new CaliPageCaption(parent, m_cali_mode);
+    m_page_caption->show_prev_btn(true);
+    m_top_sizer->Add(m_page_caption, 0, wxEXPAND, 0);
+
+    if (m_cali_mode == CalibMode::Calib_Flow_Rate) {
+        wxArrayString steps;
+        steps.Add(_L("Preset"));
+        steps.Add(_L("Calibration1"));
+        steps.Add(_L("Calibration2"));
+        steps.Add(_L("Record Factor"));
+        m_step_panel = new CaliPageStepGuide(parent, steps);
+        m_step_panel->set_steps(0);
+    }
+    else {
+        wxArrayString steps;
+        steps.Add(_L("Preset"));
+        steps.Add(_L("Calibration"));
+        steps.Add(_L("Record Factor"));
+        m_step_panel = new CaliPageStepGuide(parent, steps);
+        m_step_panel->set_steps(0);
+    }
+
+    m_top_sizer->Add(m_step_panel, 0, wxEXPAND, 0);
+
+    m_cali_stage_panel = new CaliPresetCaliStagePanel(parent);
+    m_cali_stage_panel->set_parent(this);
+    m_top_sizer->Add(m_cali_stage_panel, 0);
+
+    m_selection_panel = new wxPanel(parent);
+    m_selection_panel->SetBackgroundColour(*wxWHITE);
+    create_selection_panel(m_selection_panel);
+    init_selection_values();
+
+    m_filament_list_panel = new wxPanel(parent);
+    m_filament_list_panel->SetBackgroundColour(*wxWHITE);
+    create_filament_list_panel(m_filament_list_panel);
+
+    m_rack_nozzle_panel = new wxPanel(parent);
+    m_rack_nozzle_panel->SetBackgroundColour(*wxWHITE);
+    m_rack_nozzle_panel->Hide();
+
+    m_multi_exutrder_filament_list_panel = new wxPanel(parent);
+    m_multi_exutrder_filament_list_panel->SetBackgroundColour(*wxWHITE);
+    create_multi_extruder_filament_list_panel(m_multi_exutrder_filament_list_panel);
+
+    if (m_cali_mode == CalibMode::Calib_PA_Line || m_cali_mode == CalibMode::Calib_PA_Pattern) {
+        wxArrayString pa_cali_modes;
+        pa_cali_modes.push_back(_L("Line"));
+        pa_cali_modes.push_back(_L("Pattern"));
+        m_pa_cali_method_combox = new CaliComboBox(parent, _L("Method"), pa_cali_modes);
+    }
+
+    m_warning_panel = new CaliPresetWarningPanel(parent);
+    m_warning_panel->Hide();
+
+    m_error_panel = new CaliPresetWarningPanel(parent);
+    m_error_panel->set_color(wxColour(230, 92, 92));
+
+    m_tips_panel = new CaliPresetTipsPanel(parent);
+
+    m_sending_panel = new CaliPageSendingPanel(parent);
+    m_sending_panel->get_sending_progress_bar()->set_cancel_callback_fina([this]() {
+        on_cali_cancel_job();
+        });
+    m_sending_panel->Bind(EVT_SHOW_ERROR_FAIL_SEND, [this](auto &event){on_cali_cancel_job();});
+    m_sending_panel->Hide();
+
+    m_custom_range_panel = new CaliPresetCustomRangePanel(parent);
+
+    m_action_panel = new CaliPageActionPanel(parent, m_cali_mode, CaliPageType::CALI_PAGE_PRESET);
+
+    m_statictext_printer_msg = new Label(this, wxEmptyString, wxALIGN_CENTER_HORIZONTAL);
+    m_statictext_printer_msg->SetFont(::Label::Body_13);
+    m_statictext_printer_msg->Hide();
+
+    m_top_sizer->Add(m_selection_panel, 0);
+    m_top_sizer->Add(m_filament_list_panel, 0);
+    m_top_sizer->Add(m_rack_nozzle_panel, 0);
+    m_top_sizer->Add(m_multi_exutrder_filament_list_panel, 0);
+    if (m_pa_cali_method_combox)
+        m_top_sizer->Add(m_pa_cali_method_combox, 0);
+    m_top_sizer->Add(m_custom_range_panel, 0);
+    m_top_sizer->AddSpacer(FromDIP(15));
+    m_top_sizer->Add(m_warning_panel, 0);
+    m_top_sizer->Add(m_error_panel, 0);
+    m_top_sizer->Add(m_tips_panel, 0);
+    m_top_sizer->AddSpacer(PRESET_GAP);
+    m_top_sizer->Add(m_sending_panel, 0, wxALIGN_CENTER);
+    m_top_sizer->Add(m_statictext_printer_msg, 0, wxALIGN_CENTER_HORIZONTAL, 0);
+    m_top_sizer->Add(m_action_panel, 0, wxEXPAND, 0);
+
+    Bind(EVT_CALI_TRAY_CHANGED,       &CalibrationPresetPage::on_select_tray, this);
+    Bind(EVT_SUBAMS_CLICK,             &CalibrationPresetPage::on_subams_click, this);
+    Bind(EVT_SUBAMS_RADIO_SELECTED,    &CalibrationPresetPage::on_subams_radio_selected, this);
+}
+
+void CalibrationPresetPage::on_subams_click(wxCommandEvent& event)
+{
+    auto* fcb = dynamic_cast<FilamentExtendComboBox*>(event.GetEventObject());
+    if (!fcb || !curr_obj) return;
+
+    /* Lazily create the one shared popup on first use; subsequent clicks just re-target it. */
+    if (!m_shared_subams_popup)
+        m_shared_subams_popup = new SubAmsPopup(this);
+
+    /* Re-target the shared popup at the clicked slot: fill rows for this nozzle's slot set and
+       restore the owner's saved selection + per-tray model index. */
+    m_shared_subams_popup->SetData(curr_obj, m_filament_ams_list, m_cali_filament_mode, fcb,
+                                   fcb->GetSubAmsSlotSet());
+
+    /* anchor on the subams panel itself so popup width/position matches that area. */
+    wxWindow* anchor = fcb->GetSubAmsPanel();
+    if (!anchor) anchor = fcb;
+
+    m_shared_subams_popup->PopupAt(anchor);
+}
+
+void CalibrationPresetPage::on_subams_radio_selected(wxCommandEvent& event)
+{
+    /* Page-wide single selection in CALI_MODEL_SINGLE: clear every other radio source. */
+    if (m_cali_filament_mode != CalibrationFilamentMode::CALI_MODEL_SINGLE) return;
+
+    auto* owner = dynamic_cast<FilamentExtendComboBox*>(event.GetEventObject());
+    if (!owner) return;
+
+    auto clear_other_ext_fcbs = [owner](FilamentComboBoxList& list) {
+        for (auto* fcb : list) {
+            auto* ext = dynamic_cast<FilamentExtendComboBox*>(fcb);
+            if (!ext || ext == owner) continue;
+            ext->ClearSubAmsSelection();
+        }
+    };
+    clear_other_ext_fcbs(m_rack_filament_comboBox_list);
+
+    auto clear_plain_radios = [owner](FilamentComboBoxList& list) {
+        for (auto* fcb : list) {
+            if (fcb == owner) continue;
+            if (auto* rb = fcb->GetRadioBox()) rb->SetValue(false);
+        }
+    };
+    clear_plain_radios(m_filament_comboBox_list);
+    clear_plain_radios(m_main_filament_comboBox_list);
+    clear_plain_radios(m_deputy_filament_comboBox_list);
+    clear_plain_radios(m_rack_filament_comboBox_list);
+
+    /* The active popup belongs to the same owner; its visuals are already correct.
+       If a different owner's popup were displayed instead, ClearAllRadioVisuals would
+       reset it — but only one popup is visible at a time, so no extra work needed. */
+}
+
+void CalibrationPresetPage::update_print_status_msg(wxString msg, bool is_warning)
+{
+    update_priner_status_msg(msg, is_warning);
+}
+
+wxString CalibrationPresetPage::format_text(wxString& m_msg)
+{
+    if (wxGetApp().app_config->get("language") != "zh_CN") { return m_msg; }
+
+    wxString out_txt = m_msg;
+    wxString count_txt = "";
+    int      new_line_pos = 0;
+
+    for (int i = 0; i < m_msg.length(); i++) {
+        auto text_size = m_statictext_printer_msg->GetTextExtent(count_txt);
+        if (text_size.x < (FromDIP(600))) {
+            count_txt += m_msg[i];
+        }
+        else {
+            out_txt.insert(i - 1, '\n');
+            count_txt = "";
+        }
+    }
+    return out_txt;
+}
+
+void CalibrationPresetPage::stripWhiteSpace(std::string& str)
+{
+    if (str == "") { return; }
+
+    string::iterator cur_it;
+    cur_it = str.begin();
+
+    while (cur_it != str.end()) {
+        if ((*cur_it) == '\n' || (*cur_it) == ' ') {
+            cur_it = str.erase(cur_it);
+        }
+        else {
+            cur_it++;
+        }
+    }
+}
+
+void CalibrationPresetPage::update_priner_status_msg(wxString msg, bool is_warning)
+{
+    auto colour = is_warning ? wxColour(0xFF, 0x6F, 0x00) : wxColour(0x6B, 0x6B, 0x6B);
+    m_statictext_printer_msg->SetForegroundColour(colour);
+
+    if (msg.empty()) {
+        if (!m_statictext_printer_msg->GetLabel().empty()) {
+            m_statictext_printer_msg->SetLabel(wxEmptyString);
+            m_statictext_printer_msg->Hide();
+            Layout();
+            Fit();
+        }
+    }
+    else {
+        msg = format_text(msg);
+
+        auto str_new = msg.ToStdString();
+        stripWhiteSpace(str_new);
+
+        auto str_old = m_statictext_printer_msg->GetLabel().ToStdString();
+        stripWhiteSpace(str_old);
+
+        if (str_new != str_old) {
+            if (m_statictext_printer_msg->GetLabel() != msg) {
+                m_statictext_printer_msg->SetLabel(msg);
+                m_statictext_printer_msg->SetMinSize(wxSize(FromDIP(600), -1));
+                m_statictext_printer_msg->SetMaxSize(wxSize(FromDIP(600), -1));
+                m_statictext_printer_msg->Wrap(FromDIP(600));
+                m_statictext_printer_msg->Show();
+                Layout();
+                Fit();
+            }
+        }
+    }
+}
+
+void CalibrationPresetPage::on_select_nozzle(wxCommandEvent& evt)
+{
+    check_nozzle_diameter_for_auto_cali();
+    update_combobox_filaments(curr_obj);
+}
+
+void CalibrationPresetPage::on_select_nozzle_volume_type(wxCommandEvent &evt, size_t extruder_id)
+{
+}
+
+void CalibrationPresetPage::on_select_plate_type(wxCommandEvent& evt)
+{
+    select_default_compatible_filament();
+    check_filament_compatible();
+}
+
+void CalibrationPresetPage::on_choose_ams(wxCommandEvent& event)
+{
+    select_default_compatible_filament();
+
+    m_filament_list_panel->Show();
+    m_ams_sync_button->Show();
+    Layout();
+}
+
+void CalibrationPresetPage::on_choose_ext_spool(wxCommandEvent& event)
+{
+    m_filament_list_panel->Hide();
+    m_ams_sync_button->Hide();
+    Layout();
+}
+
+void CalibrationPresetPage::on_select_tray(wxCommandEvent& event)
+{
+    check_filament_compatible();
+    set_cali_method(m_cali_method);
+    on_recommend_input_value();
+}
+
+void CalibrationPresetPage::on_switch_ams(std::string ams_id)
+{
+    for (auto i = 0; i < m_single_ams_preview_list.size(); i++) {
+        AMSPreview *item = m_single_ams_preview_list[i];
+        if (item->get_ams_id() == ams_id) {
+            item->OnSelected();
+        } else {
+            item->UnSelected();
+        }
+    }
+
+    update_extruder_filament_combobox(ExtruderRole::SINGLE_EXTRUDER, ams_id);
+
+    select_default_compatible_filament();
+
+    Layout();
+}
+
+void CalibrationPresetPage::on_recommend_input_value()
+{
+    //TODO fix this
+    std::vector<CaliFilamentInfo> selected_filaments = get_selected_filaments();
+    if (selected_filaments.empty())
+        return;
+
+    if (m_cali_mode == CalibMode::Calib_PA_Line) {
+
+    }
+    else if (m_cali_mode == CalibMode::Calib_Flow_Rate && m_cali_stage_panel) {
+        Preset *selected_filament_preset = selected_filaments.begin()->filament_preset;
+        if (selected_filament_preset) {
+            const ConfigOptionFloatsNullable* flow_ratio_opt = selected_filament_preset->config.option<ConfigOptionFloatsNullable>("filament_flow_ratio");
+            if (flow_ratio_opt) {
+                m_cali_stage_panel->set_flow_ratio_value(flow_ratio_opt->get_at(0));
+            }
+        }
+    }
+    else if (m_cali_mode == CalibMode::Calib_Vol_speed_Tower) {
+        Preset* selected_filament_preset = selected_filaments.begin()->filament_preset;
+        if (selected_filament_preset) {
+            if (m_custom_range_panel) {
+                const ConfigOptionFloatsNullable* speed_opt = selected_filament_preset->config.option<ConfigOptionFloatsNullable>("filament_max_volumetric_speed");
+                if (speed_opt) {
+                    double max_volumetric_speed = speed_opt->get_at(0);
+                    wxArrayString values;
+                    values.push_back(wxString::Format("%.2f", max_volumetric_speed - 5));
+                    values.push_back(wxString::Format("%.2f", max_volumetric_speed + 5));
+                    values.push_back(wxString::Format("%.2f", 0.5f));
+                    m_custom_range_panel->set_values(values);
+                }
+            }
+        }
+    }
+}
+
+void CalibrationPresetPage::check_nozzle_diameter_for_auto_cali()
+{
+    m_nozzle_diameter_tips->Hide();
+    if (!curr_obj)
+        return;
+
+    if (m_cali_method == CALI_METHOD_AUTO) {
+        float nozzle_diameter = get_nozzle_value();
+        if (nozzle_diameter < 0.3) {
+            if (curr_obj->get_printer_arch() == PrinterArch::ARCH_I3) {
+                wxString tips = (boost::format(_u8L("Tip: Using a %.1fmm nozzle for auto dynamic flow calibration may have a high probability of failure.\n"
+                                        "If it fails, it is recommended to use manual calibration.")) % nozzle_diameter).str();
+                m_nozzle_diameter_tips->SetLabel(tips);
+            }
+            else if (curr_obj->get_printer_series() == PrinterSeries::SERIES_X1) {
+                wxString tips = (boost::format(_u8L("Tip: Using a %.1fmm nozzle for auto dynamic flow calibration may not get accurate calibration results.\n"
+                                        "It is recommended to use manual calibration.")) % nozzle_diameter).str();
+                m_nozzle_diameter_tips->SetLabel(tips);
+            }
+            m_nozzle_diameter_tips->Show();
+        }
+    }
+
+    Layout();
+    Fit();
+}
+
+void CalibrationPresetPage::check_filament_compatible()
+{
+    std::vector<CaliFilamentInfo> selected_filaments = get_selected_filaments();
+    std::string incompatiable_filament_name;
+    std::string error_tips;
+    int bed_temp = 0;
+
+    std::vector<Preset*> selected_filaments_list;
+    for (auto& item: selected_filaments)
+        selected_filaments_list.push_back(item.filament_preset);
+
+    check_filament_cali_reliability(selected_filaments_list);
+
+    if (!is_filaments_compatiable(selected_filaments, bed_temp, incompatiable_filament_name, error_tips)) {
+        m_tips_panel->set_params(0, 0, 0.0f);
+        if (!error_tips.empty()) {
+            wxString tips = from_u8(error_tips);
+            m_error_panel->set_warning(tips);
+        } else {
+            wxString tips = wxString::Format(_L("%s is not compatible with %s"), m_comboBox_bed_type->GetValue(), incompatiable_filament_name);
+            m_error_panel->set_warning(tips);
+        }
+        m_has_filament_incompatible = true;
+        update_show_status();
+    } else {
+        m_tips_panel->set_params(0, bed_temp, 0);
+        m_error_panel->set_warning("");
+        m_has_filament_incompatible = false;
+        update_show_status();
+    }
+
+    Layout();
+}
+
+bool CalibrationPresetPage::is_filaments_compatiable(const std::vector<CaliFilamentInfo>& prests)
+{
+    std::string incompatiable_filament_name;
+    std::string error_tips;
+    int bed_temp = 0;
+    return is_filaments_compatiable(prests, bed_temp, incompatiable_filament_name, error_tips);
+}
+
+bool CalibrationPresetPage::is_filament_in_blacklist(const CaliFilamentInfo& fila_info, std::string& error_tips)
+{
+    Preset* preset = fila_info.filament_preset;
+    if (!curr_obj || !preset)
+        return true;
+
+    int ams_id;
+    int slot_id;
+    int out_tray_id;
+    get_tray_ams_and_slot_id(curr_obj, fila_info.tray_id, ams_id, slot_id, out_tray_id);
+
+    if (wxGetApp().app_config->get("skip_ams_blacklist_check") != "true") {
+        DevFilaBlacklist::CheckResult result;
+        DevFilaBlacklist::CheckFilamentInfo check_info;
+        check_info.dev_id = curr_obj->get_dev_id();
+        check_info.model_id = curr_obj->printer_type;
+        check_info.fila_id = preset->filament_id;
+        preset->get_filament_type(check_info.fila_type);
+        check_info.ams_id = ams_id;
+        check_info.slot_id = slot_id;
+        check_info.fila_name = preset->alias;
+        check_info.has_filament_switch = curr_obj->GetFilaSwitch()->IsInstalled();
+
+        if (fila_info.nozzle_pos_id >= 0) {
+            const DevNozzle nozzle = curr_obj->get_nozzle_by_id_code(fila_info.nozzle_pos_id);
+            if (nozzle.IsEmpty()) {
+                BOOST_LOG_TRIVIAL(warning) << "selected nozzle unavailable, blacklist check uses its default nozzle info, nozzle_pos_id="
+                                           << fila_info.nozzle_pos_id << " tray_id=" << fila_info.tray_id;
+            }
+            check_info.nozzle_flow = DevNozzle::GetNozzleFlowTypeString(nozzle.GetNozzleFlowType());
+            check_info.nozzle_diameter = nozzle.GetNozzleDiameter();
+        } else {
+            BOOST_LOG_TRIVIAL(warning) << "no nozzle selected, blacklist check skips nozzle flow and diameter, nozzle_pos_id="
+                                       << fila_info.nozzle_pos_id << " tray_id=" << fila_info.tray_id;
+        }
+
+        if (m_cali_method == CalibrationMethod::CALI_METHOD_AUTO || m_cali_method == CalibrationMethod::CALI_METHOD_NEW_AUTO)
+            check_info.calib_mode = "auto_pa";
+
+        auto vendor = dynamic_cast<ConfigOptionStrings*> (preset->config.option("filament_vendor"));
+        if (vendor && (vendor->values.size() > 0)) {
+            check_info.fila_vendor = vendor->values[0];
+        }
+        result = DevFilaBlacklist::check_filaments_in_blacklist(check_info);
+
+        if (const auto& prohibition_items = result.get_prohibition_items(); !prohibition_items.empty()) {
+            wxString combined_msg;
+            for (auto item : prohibition_items) {
+                combined_msg += item.info_msg + "\n";
+            }
+
+            BOOST_LOG_TRIVIAL(warning) << "calibration filament prohibited by blacklist, ams_id=" << ams_id << " slot_id=" << slot_id
+                                       << " filament_id=" << check_info.fila_id << " nozzle_pos_id=" << fila_info.nozzle_pos_id
+                                       << " nozzle_flow=" << check_info.nozzle_flow.value_or("")
+                                       << " nozzle_diameter=" << check_info.nozzle_diameter.value_or(-1.f) << " msg: " << combined_msg;
+            error_tips = combined_msg.ToUTF8().data();
+            return false;
+        }
+
+        wxString combined_msg;
+        for (const auto& item : result.get_critical_items()) {
+            combined_msg += item.info_msg + "\n";
+        }
+
+        for (const auto& item : result.get_warning_items()) {
+            combined_msg += item.info_msg + "\n";
+        }
+
+        if (!combined_msg.IsEmpty()) {
+            error_tips = combined_msg.ToUTF8().data();
+        }
+
+        return true;
+    }
+    if (curr_obj->GetFilaSystem()->IsVirtualTrayId(std::to_string(ams_id))) {
+        if (m_cali_mode == CalibMode::Calib_PA_Line && (m_cali_method == CalibrationMethod::CALI_METHOD_AUTO || m_cali_method == CalibrationMethod::CALI_METHOD_NEW_AUTO)) {
+            std::string filamnt_type;
+            preset->get_filament_type(filamnt_type);
+            if (filamnt_type == "TPU") {
+                error_tips = _u8L("TPU is not supported for Flow Dynamics Auto-Calibration.");
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool CalibrationPresetPage::is_filaments_compatiable(const std::vector<CaliFilamentInfo> &prests,
+    int& bed_temp,
+    std::string& incompatiable_filament_name,
+    std::string& error_tips)
+{
+    if (prests.empty()) return true;
+
+    bed_temp = 0;
+    std::vector<std::string> filament_types;
+    for (auto &item : prests) {
+        const auto& item_preset = item.filament_preset;
+        if (!item_preset)
+            continue;
+
+        // update bed temperature
+        BedType curr_bed_type = BedType(m_displayed_bed_types[m_comboBox_bed_type->GetSelection()]);
+        const ConfigOptionInts *opt_bed_temp_ints = item_preset->config.option<ConfigOptionInts>(get_bed_temp_key(curr_bed_type));
+        int bed_temp_int = 0;
+        if (opt_bed_temp_ints) {
+            bed_temp_int = opt_bed_temp_ints->get_at(0);
+        }
+
+        if (bed_temp_int <= 0) {
+            if (!item_preset->alias.empty())
+                incompatiable_filament_name = item_preset->alias;
+            else
+                incompatiable_filament_name = item_preset->name;
+
+            return false;
+        } else {
+            // set for first preset
+            if (bed_temp == 0)
+                bed_temp = bed_temp_int;
+        }
+        std::string display_filament_type;
+        filament_types.push_back(item_preset->config.get_filament_type(display_filament_type, 0));
+
+        // check is it in the filament blacklist
+        if (!is_filament_in_blacklist(item, error_tips))
+            return false;
+    }
+
+    if (Print::check_multi_filaments_compatibility(filament_types) == FilamentCompatibilityType::HighLowMixed) {
+        error_tips = _u8L("Can not print multiple filaments which have large difference of temperature together. Otherwise, the extruder and nozzle may be blocked or damaged during printing");
+        return false;
+    }
+
+    return true;
+}
+
+void CalibrationPresetPage::check_filament_cali_reliability(const std::vector<Preset *> &prests)
+{
+    m_warning_panel->Hide();
+    if (!curr_obj)
+        return;
+
+    if (m_cali_method == CALI_METHOD_AUTO) {
+        std::set<std::string> foam_filaments;
+        for (auto &item : prests) {
+            if (!item)
+                continue;
+
+            if (item->filament_id == "GFA11" || item->filament_id == "GFB02") {  // PLA Aero, ASA-Aero
+                if (item->alias.empty())
+                    foam_filaments.insert(item->name);
+                else
+                    foam_filaments.insert(item->alias);
+            }
+        }
+
+        if (!foam_filaments.empty()) {
+            std::string names;
+            for (auto foam_filament : foam_filaments) {
+                names += foam_filament;
+                names += ",";
+            }
+            names.pop_back();
+
+            wxString tips;
+            if (curr_obj->get_printer_series() == PrinterSeries::SERIES_X1) {
+                tips = (boost::format(_u8L("Tip: Calibrating foam filaments(%s) in X series printers may not get accurate results\n"
+                                          "because their dynamic response is much different from that of ordinary filaments, and there is a high risk of oozing when printing calibration lines.")) %names).str();
+            }
+            else if (curr_obj->get_printer_arch() == PrinterArch::ARCH_I3) {
+                tips = (boost::format(_u8L("Tip: When using the A1/A1 mini printer, we do not recommend calibrating foam filaments(%s),\n"
+                                           "as the results may be unstable and affect print quality."))%names).str();
+            }
+            m_warning_panel->set_warning(tips);
+            m_warning_panel->Show();
+        }
+    }
+}
+
+void CalibrationPresetPage::update_plate_type_collection(CalibrationMethod method)
+{
+    m_comboBox_bed_type->Clear();
+    const ConfigOptionDef* bed_type_def = print_config_def.get("curr_bed_type");
+    if (bed_type_def && bed_type_def->enum_keys_map) {
+        for (int i = 0; i < bed_type_def->enum_labels.size(); i++) {
+            m_comboBox_bed_type->AppendString(_L(bed_type_def->enum_labels[i]));
+        }
+        m_comboBox_bed_type->SetSelection(0);
+    }
+}
+
+void CalibrationPresetPage::update_combobox_filaments(MachineObject* obj)
+{
+    if (!obj) return;
+
+    if (!obj->is_info_ready())
+        return;
+
+    //step 1: update combobox filament list
+    float nozzle_value = obj->is_multi_extruders() ? get_nozzle_diameter(MAIN_EXTRUDER_ID) : get_nozzle_value();
+    obj->GetCalib()->SetSelectedNozzleDiameter(DevNozzle::ToNozzleDiameterType(nozzle_value));
+    if (nozzle_value < 1e-3) {
+        return;
+    }
+
+    Preset* printer_preset = get_printer_preset(obj, nozzle_value);
+    if (!printer_preset)
+        return;
+
+    //step 2: sync ams info from object by default
+    sync_ams_info(obj);
+
+    //step 3: select the default compatible filament to calibration
+    select_default_compatible_filament();
+}
+
+bool CalibrationPresetPage::is_blocking_printing()
+{
+    DeviceManager* dev = Slic3r::GUI::wxGetApp().getDeviceManager();
+    if (!dev) return true;
+
+    MachineObject* obj_ = dev->get_selected_machine();
+    if (obj_ == nullptr) return true;
+
+    PresetBundle* preset_bundle = wxGetApp().preset_bundle;
+    auto source_model = preset_bundle->printers.get_edited_preset().get_printer_type(preset_bundle);
+    auto target_model = obj_->printer_type;
+
+    if (source_model != target_model) {
+        std::vector<std::string> compatible_machine = obj_->get_compatible_machine();
+        vector<std::string>::iterator it = find(compatible_machine.begin(), compatible_machine.end(), source_model);
+        if (it == compatible_machine.end()) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void CalibrationPresetPage::update_sync_button_status()
+{
+    auto set_status = [this](bool synced) {
+        StateColor synced_colour(std::pair<wxColour, int>(wxColour("#CECECE"), StateColor::Normal));
+        StateColor not_synced_colour(std::pair<wxColour, int>(wxColour("#00AE42"), StateColor::Normal));
+        if (synced) {
+            m_btn_sync->SetBorderColor(synced_colour);
+            m_btn_sync->SetIcon("ams_nozzle_sync");
+            m_sync_button_text->SetLabel(_L("AMS and nozzle information are synced"));
+        } else {
+            m_btn_sync->SetBorderColor(not_synced_colour);
+            m_btn_sync->SetIcon("printer_sync");
+            m_sync_button_text->SetLabel(_L("Sync AMS and nozzle information"));
+        }
+    };
+
+    if (!curr_obj || !curr_obj->is_info_ready()) {
+        set_status(false);
+        return;
+    }
+
+    struct CaliNozzleInfo
+    {
+        float nozzle_diameter{0.4f};
+        int   nozzle_volume_type{0};
+
+        bool operator==(const CaliNozzleInfo &other) const
+        {
+            return abs(nozzle_diameter - other.nozzle_diameter) < EPSILON
+                && nozzle_volume_type == other.nozzle_volume_type;
+        }
+    };
+
+    if (curr_obj->is_multi_extruders()) {
+        std::vector<CaliNozzleInfo> machine_obj_nozzle_infos;
+        machine_obj_nozzle_infos.resize(2);
+        for (const DevExtder& extruder : curr_obj->GetExtderSystem()->GetExtruders()) {
+            machine_obj_nozzle_infos[extruder.GetExtId()].nozzle_diameter = extruder.GetNozzleDiameter();
+            machine_obj_nozzle_infos[extruder.GetExtId()].nozzle_volume_type = int(extruder.GetNozzleFlowType()) - 1;
+        }
+
+        std::vector<CaliNozzleInfo> cali_nozzle_infos;
+        cali_nozzle_infos.resize(2);
+        for (size_t extruder_id = 0; extruder_id < 2; ++extruder_id) {
+            cali_nozzle_infos[extruder_id].nozzle_diameter = get_nozzle_diameter(extruder_id);
+            cali_nozzle_infos[extruder_id].nozzle_volume_type = int(get_nozzle_volume_type(extruder_id));
+        }
+
+        set_status(machine_obj_nozzle_infos == cali_nozzle_infos);
+    }
+    else {
+        bool is_equal = is_approx(curr_obj->GetExtderSystem()->GetNozzleDiameter(0), get_nozzle_diameter(0));
+        set_status(is_equal);
+    }
+}
+
+void CalibrationPresetPage::update_show_status()
+{
+    NetworkAgent* agent = Slic3r::GUI::wxGetApp().getAgent();
+    DeviceManager* dev = Slic3r::GUI::wxGetApp().getDeviceManager();
+    if (!agent) {return;}
+    if (!dev) return;
+
+    MachineObject* obj_ = dev->get_selected_machine();
+    if (!obj_) {
+        if (agent->is_user_login()) {
+            show_status(CaliPresetPageStatus::CaliPresetStatusInvalidPrinter);
+        }
+        else {
+            show_status(CaliPresetPageStatus::CaliPresetStatusNoUserLogin);
+        }
+        return;
+    }
+
+    if (!obj_->is_lan_mode_printer()) {
+        if (!agent->is_server_connected()) {
+            show_status(CaliPresetPageStatus::CaliPresetStatusConnectingServer);
+            return;
+        }
+    }
+
+    auto upgrade_ptr = obj_->GetUpgrade().lock();
+    if (upgrade_ptr) {
+        if (upgrade_ptr->IsUpgradeForceUpgrade()) {
+            show_status(CaliPresetStatusNeedForceUpgrading);
+            return;
+        }
+
+        if (upgrade_ptr->IsUpgradeConsistencyRequest()) {
+            show_status(CaliPresetStatusNeedConsistencyUpgrading);
+            return;
+        }
+    }
+
+    //if (is_blocking_printing()) {
+    //    show_status(CaliPresetPageStatus::CaliPresetStatusUnsupportedPrinter);
+    //    return;
+    //}
+    //else
+    if (obj_->is_connecting() || !obj_->is_connected()) {
+        show_status(CaliPresetPageStatus::CaliPresetStatusInConnecting);
+        return;
+    }
+    else if (obj_->is_in_upgrading()) {
+        show_status(CaliPresetPageStatus::CaliPresetStatusInUpgrading);
+        return;
+    }
+    else if (obj_->is_system_printing()) {
+        show_status(CaliPresetPageStatus::CaliPresetStatusInSystemPrinting);
+        return;
+    }
+    else if (obj_->ams_status_main == AMS_STATUS_MAIN_COLD_PULL) {
+        show_status(CaliPresetPageStatus::CaliPresetStatusInColdPull);
+        return;
+    }
+    else if (obj_->is_in_printing()
+          || obj_->ams_status_main == AMS_STATUS_MAIN_FILAMENT_CHANGE) {
+        show_status(CaliPresetPageStatus::CaliPresetStatusInPrinting);
+        return;
+    }
+
+    //if (obj_->is_multi_extruders()) {
+    //    float diameter = obj_->m_extder_data.extders[0].current_nozzle_diameter;
+    //    bool  is_same_diameter = std::all_of(obj_->m_extder_data.extders.begin(), obj_->m_extder_data.extders.end(),
+    //       [diameter](const Extder& extruder) {
+    //            return std::fabs(extruder.current_nozzle_diameter - diameter) < EPSILON;
+    //       });
+    //    if (!is_same_diameter) {
+    //        show_status(CaliPresetPageStatus::CaliPresetStatusDifferentNozzleDiameters);
+    //        return;
+    //    }
+    //}
+
+    // check sdcard when if lan mode printer
+    if (obj_->is_lan_mode_printer()) {
+        if (obj_->GetStorage()->get_sdcard_state() == DevStorage::SdcardState::NO_SDCARD
+            && !obj_->is_support_print_with_emmc) {
+            show_status(CaliPresetPageStatus::CaliPresetStatusLanModeNoSdcard);
+            return;
+        } else if (obj_->GetStorage()->get_sdcard_state() == DevStorage::SdcardState::HAS_SDCARD_ABNORMAL ||
+                   obj_->GetStorage()->get_sdcard_state() == DevStorage::SdcardState::HAS_SDCARD_READONLY) {
+            show_status(CaliPresetPageStatus::CaliPresetStatusLanModeSDcardNotAvailable);
+            return;
+        }
+    }
+    else if (!obj_->GetConfig()->SupportPrintWithoutSD() && (obj_->GetStorage()->get_sdcard_state() == DevStorage::SdcardState::NO_SDCARD))
+    {
+        show_status(CaliPresetPageStatus::CaliPresetStatusNoSdcard);
+        return;
+    }
+
+    if (m_has_filament_incompatible) {
+        show_status(CaliPresetPageStatus::CaliPresetStatusFilamentIncompatible);
+        return;
+    }
+
+    show_status(CaliPresetPageStatus::CaliPresetStatusNormal);
+}
+
+
+bool CalibrationPresetPage::need_check_sdcard(MachineObject* obj)
+{
+    if (!obj) return false;
+
+    bool need_check = false;
+    if (obj->get_printer_series() == PrinterSeries::SERIES_X1) {
+        if (m_cali_mode == CalibMode::Calib_Flow_Rate && m_cali_method == CalibrationMethod::CALI_METHOD_MANUAL) {
+            need_check = true;
+        }
+        else if (m_cali_mode == CalibMode::Calib_Vol_speed_Tower && m_cali_method == CalibrationMethod::CALI_METHOD_MANUAL)
+        {
+            need_check =  true;
+        }
+    }
+    else if (obj->get_printer_series() == PrinterSeries::SERIES_P1P) {
+        if (m_cali_mode == CalibMode::Calib_Flow_Rate && m_cali_method == CalibrationMethod::CALI_METHOD_MANUAL) {
+            need_check =  true;
+        }
+        else if (m_cali_mode == CalibMode::Calib_Vol_speed_Tower && m_cali_method == CalibrationMethod::CALI_METHOD_MANUAL) {
+            need_check =  true;
+        }
+    }
+    else {
+        assert(false);
+        return false;
+    }
+
+    return need_check;
+}
+
+void CalibrationPresetPage::show_status(CaliPresetPageStatus status)
+{
+    if (m_stop_update_page_status)
+        return;
+
+    if (m_page_status != status)
+        m_page_status = status;
+    else
+        return;
+
+    // other
+    if (status == CaliPresetPageStatus::CaliPresetStatusInit) {
+        update_print_status_msg(wxEmptyString, false);
+        Enable_Send_Button(false);
+    }
+    else if (status == CaliPresetPageStatus::CaliPresetStatusNormal) {
+        update_print_status_msg(wxEmptyString, false);
+        Enable_Send_Button(true);
+        Layout();
+        Fit();
+    }
+    else if (status == CaliPresetPageStatus::CaliPresetStatusNoUserLogin) {
+        wxString msg_text = _L("No login account, only printers in LAN mode are displayed");
+        update_print_status_msg(msg_text, false);
+        Enable_Send_Button(false);
+    }
+    else if (status == CaliPresetPageStatus::CaliPresetStatusInvalidPrinter) {
+        update_print_status_msg(wxEmptyString, true);
+        Enable_Send_Button(false);
+    }
+    else if (status == CaliPresetPageStatus::CaliPresetStatusConnectingServer) {
+        wxString msg_text = _L("Connecting to server");
+        update_print_status_msg(msg_text, true);
+        Enable_Send_Button(false);
+    }
+    else if (status == CaliPresetPageStatus::CaliPresetStatusInUpgrading) {
+        wxString msg_text = _L("Cannot send the print job when the printer is updating firmware");
+        update_print_status_msg(msg_text, true);
+        Enable_Send_Button(false);
+    }
+    else if (status == CaliPresetPageStatus::CaliPresetStatusInSystemPrinting) {
+        wxString msg_text = _L("The printer is executing instructions. Please restart printing after it ends");
+        update_print_status_msg(msg_text, true);
+        Enable_Send_Button(false);
+    }
+    else if (status == CaliPresetPageStatus::CaliPresetStatusInColdPull) {
+        wxString msg_text = _L("Cold pull in progress. Unable to start a task.");
+        update_print_status_msg(msg_text, true);
+        Enable_Send_Button(false);
+    }
+    else if (status == CaliPresetPageStatus::CaliPresetStatusInPrinting) {
+        wxString msg_text = _L("The printer is busy on other print job");
+        update_print_status_msg(msg_text, true);
+        Enable_Send_Button(false);
+    }
+    else if (status == CaliPresetPageStatus::CaliPresetStatusLanModeNoSdcard) {
+        wxString msg_text = _L("Storage needs to be inserted before printing via LAN.");
+        update_print_status_msg(msg_text, true);
+        Enable_Send_Button(false);
+    }
+    else if (status == CaliPresetPageStatus::CaliPresetStatusLanModeSDcardNotAvailable) {
+        wxString msg_text = _L("Storage is not available or is in read-only mode.");
+        update_print_status_msg(msg_text, true);
+        Enable_Send_Button(false);
+    }
+    else if (status == CaliPresetPageStatus::CaliPresetStatusNoSdcard) {
+        wxString msg_text = _L("Storage needs to be inserted before printing.");
+        update_print_status_msg(msg_text, true);
+        Enable_Send_Button(false);
+    }
+    else if (status == CaliPresetPageStatus::CaliPresetStatusNeedForceUpgrading) {
+        wxString msg_text = _L("Cannot send the print job to a printer whose firmware is required to get updated.");
+        update_print_status_msg(msg_text, true);
+        Enable_Send_Button(false);
+    }
+    else if (status == CaliPresetPageStatus::CaliPresetStatusNeedConsistencyUpgrading) {
+        wxString msg_text = _L("Cannot send the print job to a printer whose firmware is required to get updated.");
+        update_print_status_msg(msg_text, true);
+        Enable_Send_Button(false);
+    }
+    else if (status == CaliPresetPageStatus::CaliPresetStatusFilamentIncompatible) {
+        update_print_status_msg(wxEmptyString, false);
+        Enable_Send_Button(false);
+    }
+    else if (status == CaliPresetPageStatus::CaliPresetStatusInConnecting) {
+        wxString msg_text = _L("Connecting to printer");
+        update_print_status_msg(msg_text, true);
+        Enable_Send_Button(false);
+    }
+    else if (status == CaliPresetPageStatus::CaliPresetStatusDifferentNozzleDiameters) {
+        std::string cwp_msg_pt = curr_obj ? curr_obj->printer_type : wxGetApp().preset_bundle->printers.get_edited_preset().get_printer_type(wxGetApp().preset_bundle);
+        wxString msg_text = wxString::Format(_L("Calibration only supports cases where the %s and %s diameters are identical."),
+            _L(DevPrinterConfigUtil::get_toolhead_display_name(cwp_msg_pt, MAIN_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::LowerCase)),
+            _L(DevPrinterConfigUtil::get_toolhead_display_name(cwp_msg_pt, DEPUTY_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::LowerCase)));
+        update_print_status_msg(msg_text, true);
+        Enable_Send_Button(false);
+    }
+
+    Layout();
+}
+
+void CalibrationPresetPage::Enable_Send_Button(bool enable)
+{
+    m_action_panel->enable_button(CaliPageActionType::CALI_ACTION_CALI, enable);
+}
+
+float CalibrationPresetPage::get_nozzle_value()
+{
+    double nozzle_value = 0.0;
+
+    auto sel = m_comboBox_nozzle_dia->GetSelection();
+    if (sel != wxNOT_FOUND) {
+        auto diameter = NozzleDiameterType(*(int*)m_comboBox_nozzle_dia->GetClientData(sel));
+        nozzle_value = DevNozzle::ToNozzleDiameterFloat(diameter);
+    }
+
+    return nozzle_value;
+}
+
+void CalibrationPresetPage::update(MachineObject* obj)
+{
+    curr_obj = obj;
+
+    //update printer status
+    update_show_status();
+
+    update_sync_button_status();
+}
+
+void CalibrationPresetPage::on_device_connected(MachineObject* obj)
+{
+    init_selection_values();
+    init_with_machine(obj);
+    update_combobox_filaments(obj);
+}
+
+void CalibrationPresetPage::set_cali_filament_mode(CalibrationFilamentMode mode)
+{
+    CalibrationWizardPage::set_cali_filament_mode(mode);
+
+    for (int i = 0; i < m_filament_comboBox_list.size(); i++) {
+        m_filament_comboBox_list[i]->set_select_mode(mode);
+    }
+    for (auto& fcb : m_rack_filament_comboBox_list) {
+        fcb->set_select_mode(mode);
+    }
+
+    if (mode == CALI_MODEL_MULITI) {
+        m_filament_list_tips->Show();
+    } else {
+        m_filament_list_tips->Hide();
+    }
+}
+
+void CalibrationPresetPage::set_cali_method(CalibrationMethod method)
+{
+    CalibrationWizardPage::set_cali_method(method);
+    if (method == CalibrationMethod::CALI_METHOD_MANUAL) {
+        if (m_cali_mode == CalibMode::Calib_Flow_Rate) {
+            wxArrayString steps;
+            steps.Add(_L("Preset"));
+            steps.Add(_L("Calibration1"));
+            steps.Add(_L("Calibration2"));
+            steps.Add(_L("Record Factor"));
+            m_step_panel->set_steps_string(steps);
+            m_step_panel->set_steps(0);
+            if (m_cali_stage_panel)
+                m_cali_stage_panel->Show();
+
+            if (m_pa_cali_method_combox)
+                m_pa_cali_method_combox->Show(false);
+
+            if (m_custom_range_panel)
+                m_custom_range_panel->Show(false);
+        }
+        else if (m_cali_mode == CalibMode::Calib_PA_Line || m_cali_mode == CalibMode::Calib_PA_Pattern) {
+            if (m_cali_stage_panel)
+                m_cali_stage_panel->Show(false);
+
+            if (m_pa_cali_method_combox)
+                m_pa_cali_method_combox->Show();
+
+            if (m_custom_range_panel) {
+                wxArrayString titles;
+                titles.push_back(_L("From k Value"));
+                titles.push_back(_L("To k Value"));
+                titles.push_back(_L("Value step"));
+                m_custom_range_panel->set_titles(titles);
+
+                wxArrayString values;
+                ExtruderType extruder_type  = ExtruderType::etDirectDrive;
+                auto selected_filament = get_selected_filament_combobox();
+                int extruder_id = !selected_filament.empty() && selected_filament[0].extruder_role == ExtruderRole::DEPUTY_EXTRUDER ? DEPUTY_EXTRUDER_ID : MAIN_EXTRUDER_ID;
+                Preset* printer_preset = get_printer_preset(curr_obj, get_nozzle_diameter(extruder_id));
+                if (!selected_filament.empty() && printer_preset) {
+                    int tray_id     = selected_filament[0].tray_id;
+                    int out_tray_id = tray_id;
+                    int ams_id      = 0;
+                    int slot_id     = 0;
+                    get_tray_ams_and_slot_id(curr_obj, tray_id, ams_id, slot_id, out_tray_id);
+                    std::vector<int> physical_extruder_maps = dynamic_cast<ConfigOptionInts *>(printer_preset->config.option("physical_extruder_map"))->values;
+                    int              extruder_count         = dynamic_cast<ConfigOptionFloatsNullable *>(printer_preset->config.option("nozzle_diameter"))->values.size();
+                    int              extruder_idx           = extruder_id;
+                    for (size_t index = 0; index < extruder_count; ++index) {
+                        if (physical_extruder_maps[index] == extruder_id) {
+                            extruder_idx = index;
+                        }
+                    }
+                    extruder_type = ExtruderType(printer_preset->config.opt_enum("extruder_type", extruder_idx));
+                }
+
+                if (extruder_type == ExtruderType::etBowden) {
+                    values.push_back(wxString::Format(wxT("%.0f"), 0));
+                    values.push_back(wxString::Format(wxT("%.1f"), 0.5));
+                    values.push_back(wxString::Format(wxT("%.2f"), 0.05));
+                } else {
+                    values.push_back(wxString::Format(wxT("%.0f"), 0));
+                    values.push_back(wxString::Format(wxT("%.2f"), 0.05));
+                    values.push_back(wxString::Format(wxT("%.3f"), 0.005));
+                }
+                m_custom_range_panel->set_values(values);
+
+                m_custom_range_panel->set_unit("");
+                m_custom_range_panel->Show();
+            }
+        }
+    }
+    else {
+        wxArrayString steps;
+        steps.Add(_L("Preset"));
+        steps.Add(_L("Calibration"));
+        steps.Add(_L("Record Factor"));
+        m_step_panel->set_steps_string(steps);
+        m_step_panel->set_steps(0);
+        if (m_cali_stage_panel)
+            m_cali_stage_panel->Show(false);
+        if (m_custom_range_panel)
+            m_custom_range_panel->Show(false);
+        if (m_pa_cali_method_combox)
+            m_pa_cali_method_combox->Show(false);
+    }
+}
+
+void CalibrationPresetPage::on_cali_start_job()
+{
+    m_sending_panel->reset();
+    m_sending_panel->Show();
+    Enable_Send_Button(false);
+    m_action_panel->show_button(CaliPageActionType::CALI_ACTION_CALI, false);
+    Layout();
+    Fit();
+
+    m_stop_update_page_status = true;
+}
+
+void CalibrationPresetPage::on_cali_finished_job()
+{
+    m_sending_panel->reset();
+    m_sending_panel->Show(false);
+    update_print_status_msg(wxEmptyString, false);
+    Enable_Send_Button(true);
+    m_action_panel->show_button(CaliPageActionType::CALI_ACTION_CALI, true);
+    Layout();
+    Fit();
+
+    m_stop_update_page_status = false;
+}
+
+void CalibrationPresetPage::on_cali_cancel_job()
+{
+    BOOST_LOG_TRIVIAL(info) << "CalibrationWizard::print_job: enter canceled";
+    if (CalibUtils::print_job) {
+        if (CalibUtils::print_job->is_running()) {
+            BOOST_LOG_TRIVIAL(info) << "calibration_print_job: canceled";
+            CalibUtils::print_job->cancel();
+        }
+        CalibUtils::print_job->join();
+    }
+
+    m_sending_panel->reset();
+    m_sending_panel->Show(false);
+    update_print_status_msg(wxEmptyString, false);
+    Enable_Send_Button(true);
+    m_action_panel->show_button(CaliPageActionType::CALI_ACTION_CALI, true);
+    Layout();
+    Fit();
+
+    m_stop_update_page_status = false;
+}
+
+void CalibrationPresetPage::init_with_machine(MachineObject* obj)
+{
+    if (!obj) return;
+
+    //set flow ratio calibration type
+    m_cali_stage_panel->set_flow_ratio_calibration_type(obj->GetCalib()->GetFlowRatioCalibType());
+    // set nozzle value from machine
+    auto diameter = obj->GetExtderSystem()->GetNozzleDiameterType(0);
+
+    if (switch_combox_to_target(m_comboBox_nozzle_dia, diameter)) {
+        wxCommandEvent event(wxEVT_COMBOBOX);
+        event.SetEventObject(this);
+        wxPostEvent(m_comboBox_nozzle_dia, event);
+        m_comboBox_nozzle_dia->SetToolTip(_L("The nozzle diameter has been synchronized from the printer Settings"));
+    } else {
+        m_comboBox_nozzle_dia->SetToolTip(wxEmptyString);
+        // set default to 0.4
+        switch_combox_to_target(m_comboBox_nozzle_dia, NozzleDiameterType::NOZZLE_DIAMETER_0_4);
+    }
+
+    std::map<int, ComboBox*> nozzle_diameter_combox_map {
+        {MAIN_EXTRUDER_ID, m_right_comboBox_nozzle_dia},
+        {DEPUTY_EXTRUDER_ID, m_left_comboBox_nozzle_dia}
+    };
+
+    std::map<int, ComboBox*> nozzle_volume_combox_map {
+        {MAIN_EXTRUDER_ID, m_right_comboBox_nozzle_volume},
+        {DEPUTY_EXTRUDER_ID, m_left_comboBox_nozzle_volume}
+    };
+
+    if (obj->is_multi_extruders()) {
+        for (size_t i = 0; i < obj->GetExtderSystem()->GetTotalExtderCount(); ++i) {
+            auto diameter = obj->GetExtderSystem()->GetNozzleDiameterType(i);
+            if (switch_combox_to_target(nozzle_diameter_combox_map[i], diameter)) {
+                wxCommandEvent event(wxEVT_COMBOBOX);
+                event.SetEventObject(this);
+                wxPostEvent(nozzle_diameter_combox_map[i], event);
+                nozzle_diameter_combox_map[i]->SetToolTip(_L("The nozzle diameter has been synchronized from the printer Settings"));
+            } else {
+                nozzle_diameter_combox_map[i]->SetToolTip(wxEmptyString);
+                switch_combox_to_target(nozzle_diameter_combox_map[i], NozzleDiameterType::NOZZLE_DIAMETER_0_4);
+            }
+
+            if (obj->GetExtderSystem()->GetNozzleFlowType(i) != NozzleFlowType::NONE_FLOWTYPE) {
+                auto volume_type = DevNozzle::ToNozzleVolumeType(obj->GetExtderSystem()->GetNozzleFlowType(i));
+                switch_combox_to_target(nozzle_volume_combox_map[i], volume_type);
+            } else {
+                nozzle_volume_combox_map[i]->SetSelection(0);
+            }
+        }
+
+        std::string cwp_swap_pt = obj->printer_type;
+        // Refresh Nozzle Info box labels with connected printer type
+        if (m_left_nozzle_volume_type_sizer) {
+            m_left_nozzle_volume_type_sizer->GetStaticBox()->SetLabel(
+                _L(DevPrinterConfigUtil::get_toolhead_display_name(cwp_swap_pt, DEPUTY_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::TitleCase)));
+        }
+        if (m_right_nozzle_volume_type_sizer) {
+            m_right_nozzle_volume_type_sizer->GetStaticBox()->SetLabel(
+                _L(DevPrinterConfigUtil::get_toolhead_display_name(cwp_swap_pt, MAIN_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::TitleCase)));
+        }
+        // Refresh Filament For Calibration box labels unconditionally
+        if (obj->is_main_extruder_on_left()) {
+            m_main_sizer->GetStaticBox()->SetLabel(_L(DevPrinterConfigUtil::get_toolhead_display_name(cwp_swap_pt, DEPUTY_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::TitleCase)));
+            m_deputy_sizer->GetStaticBox()->SetLabel(_L(DevPrinterConfigUtil::get_toolhead_display_name(cwp_swap_pt, MAIN_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::TitleCase)));
+        } else {
+            m_main_sizer->GetStaticBox()->SetLabel(_L(DevPrinterConfigUtil::get_toolhead_display_name(cwp_swap_pt, MAIN_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::TitleCase)));
+            m_deputy_sizer->GetStaticBox()->SetLabel(_L(DevPrinterConfigUtil::get_toolhead_display_name(cwp_swap_pt, DEPUTY_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::TitleCase)));
+        }
+        if (!obj->is_main_extruder_on_left() && m_main_extruder_on_left) {
+            m_multi_exturder_ams_sizer->Detach(m_main_filament_cali_panel);
+            m_multi_exturder_ams_sizer->Detach(m_deputy_filament_cali_panel);
+
+            m_main_sizer->GetStaticBox()->SetLabel(_L(DevPrinterConfigUtil::get_toolhead_display_name(cwp_swap_pt, MAIN_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::TitleCase)));
+            m_deputy_sizer->GetStaticBox()->SetLabel(_L(DevPrinterConfigUtil::get_toolhead_display_name(cwp_swap_pt, DEPUTY_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::TitleCase)));
+            m_multi_exturder_ams_sizer->Add(m_deputy_filament_cali_panel, 0, wxEXPAND | wxALL | wxALIGN_BOTTOM, 10);
+            m_multi_exturder_ams_sizer->Add(m_main_filament_cali_panel, 0, wxEXPAND | wxALL | wxALIGN_BOTTOM, 10);
+
+            m_main_extruder_on_left = false;
+        }
+        else if (obj->is_main_extruder_on_left() && !m_main_extruder_on_left) {
+            m_multi_exturder_ams_sizer->Detach(m_main_filament_cali_panel);
+            m_multi_exturder_ams_sizer->Detach(m_deputy_filament_cali_panel);
+
+            m_main_sizer->GetStaticBox()->SetLabel(_L(DevPrinterConfigUtil::get_toolhead_display_name(cwp_swap_pt, DEPUTY_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::TitleCase)));
+            m_deputy_sizer->GetStaticBox()->SetLabel(_L(DevPrinterConfigUtil::get_toolhead_display_name(cwp_swap_pt, MAIN_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::TitleCase)));
+            m_multi_exturder_ams_sizer->Add(m_main_filament_cali_panel, 0, wxEXPAND | wxALL | wxALIGN_BOTTOM, 10);
+            m_multi_exturder_ams_sizer->Add(m_deputy_filament_cali_panel, 0, wxEXPAND | wxALL | wxALIGN_BOTTOM, 10);
+
+            m_main_extruder_on_left = true;
+        }
+
+        m_single_nozzle_info_panel->Hide();
+        m_multi_nozzle_info_panel->Show();
+        m_multi_exutrder_filament_list_panel->Show();
+        m_filament_list_panel->Hide();
+    }
+    else {
+
+        if ((obj->GetExtderSystem()->GetTotalExtderCount() > 0) && (obj->GetExtderSystem()->GetNozzleFlowType(0) != NozzleFlowType::NONE_FLOWTYPE))
+        {
+            auto volume_type = DevNozzle::ToNozzleVolumeType(obj->GetExtderSystem()->GetNozzleFlowType(0));
+            for(unsigned int i=0; i < m_comboBox_nozzle_volume->GetCount(); i++) {
+                if(volume_type == NozzleVolumeType(*(int*)m_comboBox_nozzle_volume->GetClientData(i))) {
+                    m_comboBox_nozzle_volume->SetSelection(i);
+                    break;
+                }
+            }
+        } else {
+            m_comboBox_nozzle_volume->SetSelection(0);
+        }
+
+        m_single_nozzle_info_panel->Show();
+        m_multi_nozzle_info_panel->Hide();
+        m_multi_exutrder_filament_list_panel->Hide();
+        m_filament_list_panel->Show();
+    }
+    // init filaments for calibration
+    sync_ams_info(obj);
+
+    Layout();
+}
+
+void CalibrationPresetPage::sync_ams_info(MachineObject* obj)
+{
+    if (!obj) return;
+    // read ams slot info from printer, then save to DynamicPrintConfig
+    std::map<int, DynamicPrintConfig> full_filament_ams_list = CalibUtils::build_filament_ams_list(obj);
+    for (auto& [tray_id, tray_item] : full_filament_ams_list) {
+        if (obj->GetFilaSystem()->IsVirtualTrayId(std::to_string(tray_id))) {
+            tray_item.set_key_value("filament_exist", new ConfigOptionBools{true});
+        }
+    }
+
+    // sync m_filament_ams_list from obj ams list
+    m_filament_ams_list.clear();
+    for (auto& ams_item : obj->GetFilaSystem()->GetAmsList()) {
+        for (auto& tray_item: ams_item.second->GetTrays()) {
+            try {
+                int ams_id  = std::stoi(ams_item.second->GetAmsId());
+                int slot_id = std::stoi(tray_item.second->id);
+                int tray_id = obj->GetFilaSystem()->GetTrayIdByAmsSlotId(ams_id, slot_id);
+
+                if (auto it = full_filament_ams_list.find(tray_id); it != full_filament_ams_list.end()) {
+                    m_filament_ams_list[tray_id] = it->second;
+                }
+            } catch(...) {
+                BOOST_LOG_TRIVIAL(error) << "invalid " << KV(log_key::ams_id, ams_item.second->GetAmsId()) << "or "
+                                         << KV(log_key::slot_id, tray_item.second->id);
+            }
+        }
+    }
+
+    // init virtual trays info
+    for (auto& [vt_id, vt_tray] : obj->GetFilaSystem()->GetVirtualTrays()) {
+        try {
+            int vt_tray_id = std::stoi(vt_id);
+            if (!obj->GetFilaSwitch()->IsInstalled() && full_filament_ams_list.find(vt_tray_id) != full_filament_ams_list.end()) {
+                m_filament_ams_list[vt_tray_id] = full_filament_ams_list[vt_tray_id];
+            } else {
+                m_filament_ams_list[vt_tray_id] = get_empty_dynamic_print_config();
+            }
+        } catch(...) {
+            BOOST_LOG_TRIVIAL(error) << "invalid vt_id:" << vt_id;
+        }
+    }
+
+    std::vector<AMSinfo> ams_info;
+    std::vector<AMSinfo> main_ams_info;
+    std::vector<AMSinfo> deputy_ams_info;
+    {
+        /* add ams info to ams_info_list */
+        for (auto &ams : obj->GetFilaSystem()->GetAmsList()) {
+            AMSinfo info;
+            info.ams_id = ams.first;
+
+            if (ams.second->IsExist() && info.parse_ams_info(obj, ams.second, obj->GetFilaSystem()->IsDetectRemainEnabled(), obj->is_support_ams_humidity)) {
+                for (int extruder_id : ams.second->GetBindedExtruderSet()) {
+                    if (extruder_id == MAIN_EXTRUDER_ID) {
+                        ams_info.push_back(info);
+                        main_ams_info.push_back(info);
+                    } else {
+                        deputy_ams_info.push_back(info);
+                    }
+                }
+            }
+        }
+
+        /* add vt_ams info to ams info list*/
+        for (auto [vt_id, vt_tray] : obj->GetFilaSystem()->GetVirtualTrays()) {
+            AMSinfo     info;
+            info.parse_ext_info(obj, vt_tray);
+            info.ams_type = DevAmsType::EXT_SPOOL;
+
+            if (vt_tray.id == std::to_string(VIRTUAL_TRAY_MAIN_ID)) {
+                ams_info.push_back(info);
+                main_ams_info.push_back(info);
+            } else if (vt_tray.id == std::to_string(VIRTUAL_TRAY_DEPUTY_ID)) {
+                deputy_ams_info.push_back(info);
+            } else if (obj->GetNozzleRack()->IsDirectConnectedRack()) {
+                ams_info.push_back(info);
+            } else {
+                BOOST_LOG_TRIVIAL(warning) << "may be a unknown virtual tray id:" << vt_tray.id;
+            }
+        }
+    }
+
+    update_nozzle_id_combox();
+
+    auto rack = obj->GetNozzleRack();
+    if (rack->IsSupported() && rack->IsDirectConnectedRack()) {
+        /* RackType_A/B: refresh statically pre-created rack panel (no widget rebuild) */
+        m_single_nozzle_info_panel->Hide();
+        m_single_ams_preview_panel->Hide();
+        m_single_ams_items_panel->Hide();
+        m_filament_list_panel->Hide();
+
+        if (!m_rack_nozzle_panel->GetSizer()) {
+            m_rack_nozzle_panel->SetSizer(create_rack_items_sizer(m_rack_nozzle_panel, m_rack_filament_comboBox_list));
+            wxGetApp().UpdateDarkUIWin(m_rack_nozzle_panel);
+        }
+
+        update_rack_filament_combobox(obj);
+
+        m_rack_nozzle_panel->Show();
+    } else {
+        m_rack_nozzle_panel->Hide();
+        // restore panels hidden by the rack branch when switching from a rack printer
+        m_single_ams_preview_panel->Show();
+        m_single_ams_items_panel->Show();
+        if (!obj->is_multi_extruders()) {
+            m_filament_list_panel->Show();
+        }
+
+        // update filament from panel, display only obj has ams
+        // update multi ams panel, display only obj has multi ams
+        if (obj->HasAms()) {
+            if (obj->is_multi_extruders()) {
+                auto ams_list = obj->GetFilaSystem()->GetAmsList();
+                {
+                    auto main_it = std::find_if(ams_list.begin(), ams_list.end(), [](auto ams_item){
+                        auto extruder_set = ams_item.second->GetBindedExtruderSet();
+                        return extruder_set.find(MAIN_EXTRUDER_ID) != extruder_set.end();
+                    });
+                    if (main_it != ams_list.end()) {
+                        update_extruder_filament_combobox(ExtruderRole::MAIN_EXTRUDER, main_it->second->GetAmsId());
+                    } else {
+                        update_extruder_filament_combobox(ExtruderRole::MAIN_EXTRUDER, std::to_string(VIRTUAL_TRAY_MAIN_ID));
+                    }
+                }
+                {
+                    auto deputy_it = std::find_if(ams_list.begin(), ams_list.end(), [](auto ams_item){
+                        auto extruder_set = ams_item.second->GetBindedExtruderSet();
+                        return extruder_set.find(DEPUTY_EXTRUDER_ID) != extruder_set.end();
+                    });
+                    if (deputy_it != ams_list.end()) {
+                        update_extruder_filament_combobox(ExtruderRole::DEPUTY_EXTRUDER, deputy_it->second->GetAmsId());
+                    } else {
+                        update_extruder_filament_combobox(ExtruderRole::DEPUTY_EXTRUDER, std::to_string(VIRTUAL_TRAY_DEPUTY_ID));
+                    }
+                }
+            }
+            else {
+                if (obj->GetFilaSystem()->GetAmsList().size() > 1) {
+                    on_switch_ams(obj->GetFilaSystem()->GetAmsList().begin()->first);
+                } else {
+                    if (!obj->GetFilaSystem()->GetAmsList().empty())
+                        update_extruder_filament_combobox(ExtruderRole::SINGLE_EXTRUDER, obj->GetFilaSystem()->GetAmsList().begin()->first);
+                }
+            }
+        }
+        else {
+            if (obj->is_multi_extruders()) {
+                update_extruder_filament_combobox(ExtruderRole::MAIN_EXTRUDER, std::to_string(VIRTUAL_TRAY_MAIN_ID));
+                update_extruder_filament_combobox(ExtruderRole::DEPUTY_EXTRUDER, std::to_string(VIRTUAL_TRAY_DEPUTY_ID));
+            } else {
+                update_extruder_filament_combobox(ExtruderRole::SINGLE_EXTRUDER, std::to_string(VIRTUAL_TRAY_MAIN_ID));
+            }
+        }
+
+        /* update ams preview */
+        {   //single extuder
+            auto ams_items_sizer = create_ams_items_sizer(m_single_ams_preview_panel, m_single_ams_preview_list, ams_info, ExtruderRole::SINGLE_EXTRUDER);
+            auto ams_sizer = new wxBoxSizer(wxVERTICAL);
+            ams_sizer->Add(ams_items_sizer, 0);
+            ams_sizer->AddSpacer(FromDIP(10));
+
+            m_single_ams_preview_panel->SetSizer(ams_sizer);
+        }
+        {   //multi extuder
+            m_main_ams_preview_panel->SetSizer(create_ams_items_sizer(m_main_ams_preview_panel, m_main_ams_preview_list, main_ams_info, ExtruderRole::MAIN_EXTRUDER));
+            m_deputy_ams_preview_panel->SetSizer(create_ams_items_sizer(m_deputy_ams_preview_panel, m_deputy_ams_preview_list, deputy_ams_info, ExtruderRole::DEPUTY_EXTRUDER));
+        }
+    }
+
+    /* display nozzle combobox */
+    {
+        auto has_rack = obj->GetNozzleSystem()->GetNozzleRack()->IsSupported();
+        if (has_rack) {
+            m_tips_map["rack"].first = true;
+            m_right_comboBox_nozzle_dia->Enable();
+            m_right_comboBox_nozzle_volume->Enable();
+        } else {
+            m_tips_map["rack"].first = false;
+            m_right_comboBox_nozzle_dia->Disable();
+            m_right_comboBox_nozzle_volume->Disable();
+        }
+
+        m_filament_list_tips->SetLabel(get_filament_tips());
+    }
+
+    disable_bowden_extuder_auto_dyn_cali(m_main_filament_cali_panel);
+
+    Layout();
+}
+
+void CalibrationPresetPage::update_nozzle_id_combox()
+{
+    MachineObject *obj = get_current_object();
+
+    if (!obj || !obj->GetNozzleSystem()) return;
+
+    auto rack     = obj->GetNozzleSystem()->GetNozzleRack();
+    bool has_rack = rack->IsSupported();
+    if (has_rack) {
+        NozzleDiameterType nozzle_diameter;
+        auto dia_sel = m_right_comboBox_nozzle_dia->GetSelection();
+        if (dia_sel != wxNOT_FOUND) {
+            nozzle_diameter = NozzleDiameterType(*(int*)m_right_comboBox_nozzle_dia->GetClientData(dia_sel));
+        } else {
+            nozzle_diameter = NozzleDiameterType::NONE_DIAMETER_TYPE;
+        }
+        std::vector<NozzleFlowType> nozzle_flows;
+        auto sel = m_right_comboBox_nozzle_volume->GetSelection();
+        if(sel != wxNOT_FOUND) {
+            auto volume_type = NozzleVolumeType(*(int*)m_right_comboBox_nozzle_volume->GetClientData(sel));
+            if (volume_type != NozzleVolumeType::nvtHybrid)
+                nozzle_flows.emplace_back(DevNozzle::ToNozzleFlowType(volume_type));
+            else {
+                for (auto volume : volumes) {
+                    if (volume != NozzleVolumeType::nvtHybrid)
+                        nozzle_flows.emplace_back(DevNozzle::ToNozzleFlowType(volume));
+                }
+            }
+        } else {
+            nozzle_flows.emplace_back(NozzleFlowType::NONE_FLOWTYPE);
+        }
+
+        int  r_nozzle_id = obj->GetExtderSystem()->GetExtderById(MAIN_EXTRUDER_ID)->GetNozzleId();
+        auto r_nozzle    = obj->GetNozzleSystem()->GetExtNozzle(r_nozzle_id);
+        auto nozzle_map  = rack->GetRackNozzles();
+
+        auto nozzle_list = make_nozzles_info(r_nozzle, nozzle_map, nozzle_diameter, nozzle_flows);
+        for (auto &fcb : m_main_filament_comboBox_list) {
+            fcb->UpdateNozzleCombo(nozzle_list);
+            fcb->ShowNozzleCombo();
+        }
+    } else {
+        for (auto &fcb : m_main_filament_comboBox_list) {
+            fcb->HideNozzleCombo();
+        }
+    }
+}
+
+std::vector<std::pair<wxString, int>> CalibrationPresetPage::make_nozzles_info(const DevNozzle                      &r_nozzle,
+                                                                               const std::map<int, DevNozzle>       &nozzle_map,
+                                                                               const NozzleDiameterType             &nozzle_diameter,
+                                                                               const std::vector<NozzleFlowType>    &nozzle_flows)
+{
+    std::vector<std::pair<wxString, int>> nozzle_list;
+
+    bool exist = std::find(nozzle_flows.begin(), nozzle_flows.end(), r_nozzle.GetNozzleFlowType()) != nozzle_flows.end();
+    if (r_nozzle.IsNormal() && r_nozzle.GetNozzleDiameterType() == nozzle_diameter && exist) {
+        wxString item = wxString::Format("R | %s %s", r_nozzle.GetNozzleDiameterStr(), r_nozzle.GetNozzleFlowTypeStr());
+        nozzle_list.emplace_back(item, 0);
+    }
+    for (auto &nozzle : nozzle_map) {
+        exist = std::find(nozzle_flows.begin(), nozzle_flows.end(), nozzle.second.GetNozzleFlowType()) != nozzle_flows.end();
+        if (nozzle.second.IsNormal() && nozzle.second.GetNozzleDiameterType() == nozzle_diameter && exist) {
+            wxString item = wxString::Format("%d | %s %s", nozzle.second.GetNozzleId() + 1, nozzle.second.GetNozzleDiameterStr(), nozzle.second.GetNozzleFlowTypeStr());
+            nozzle_list.emplace_back(item, 0x10 | nozzle.second.GetNozzleId());
+        }
+    }
+
+    return nozzle_list;
+}
+
+void CalibrationPresetPage::disable_bowden_extuder_auto_dyn_cali(wxWindow* cali_panel){
+    // only support one extruder is bowden
+    if ((m_cali_method == CalibrationMethod::CALI_METHOD_AUTO || m_cali_method == CalibrationMethod::CALI_METHOD_NEW_AUTO) && get_extruder_type(MAIN_EXTRUDER_ID) == ExtruderType::etBowden) {
+        m_tips_map["bowden_left"].first = false;
+        m_tips_map["bowden_right"].first = true;
+        cali_panel->Disable();
+    } else if ((m_cali_method == CalibrationMethod::CALI_METHOD_AUTO || m_cali_method == CalibrationMethod::CALI_METHOD_NEW_AUTO) && get_extruder_type(DEPUTY_EXTRUDER_ID) == ExtruderType::etBowden) {
+        m_tips_map["bowden_left"].first = true;
+        m_tips_map["bowden_right"].first = false;
+        cali_panel->Disable();
+    } else {
+        m_tips_map["bowden_left"].first = false;
+        m_tips_map["bowden_right"].first = false;
+        cali_panel->Enable();
+    }
+
+    m_filament_list_tips->SetLabel(get_filament_tips());
+}
+
+void CalibrationPresetPage::select_default_compatible_filament()
+{
+    if (!curr_obj)
+        return;
+
+    if (curr_obj->is_multi_extruders()) {
+        auto select_first_compatible_filament = [this](FilamentComboBoxList& filament_list) -> bool {
+            for (auto &fcb : filament_list) {
+                if (!fcb || !fcb->GetRadioBox() || !fcb->GetRadioBox()->IsEnabled()) {
+                    continue;
+                }
+
+                int tray_id = fcb->get_tray_id();
+                if (tray_id < 0) {
+                    fcb->SetValue(false);
+                    continue;
+                }
+
+                Preset* preset = const_cast<Preset*>(fcb->GetComboBox()->get_selected_preset());
+                if (!preset) {
+                    fcb->SetValue(false);
+                    continue;
+                }
+
+                int nozzle_pos_id = fcb->GetNozzlePosId();
+                std::string nozzle_sn;
+                if (nozzle_pos_id != -1) {
+                    DevNozzle nozzle = curr_obj->get_nozzle_by_id_code(nozzle_pos_id);
+                    nozzle_sn = nozzle.GetSerialNumber().ToStdString();
+                }
+
+                int extruder_id = fcb->GetExtuderRole() == ExtruderRole::DEPUTY_EXTRUDER ? DEPUTY_EXTRUDER_ID : MAIN_EXTRUDER_ID;
+                std::vector<CaliFilamentInfo> selected_filament{
+                    CaliFilamentInfo(preset, nozzle_pos_id, nozzle_sn, extruder_id, tray_id)
+                };
+
+                if (is_filaments_compatiable(selected_filament)) {
+                    manage_filament_radio_btn(fcb);
+
+                    wxCommandEvent event(wxEVT_TOGGLEBUTTON);
+                    event.SetEventObject(this);
+                    wxPostEvent(fcb->GetRadioBox(), event);
+                    Layout();
+                    return true;
+                }
+
+                fcb->SetValue(false);
+            }
+
+            return false;
+        };
+
+        if (!select_first_compatible_filament(m_main_filament_comboBox_list))
+            select_first_compatible_filament(m_deputy_filament_comboBox_list);
+
+        check_filament_compatible();
+        return;
+    }
+
+    std::string ams_id;
+    for (AMSPreview* ams_perview : m_single_ams_preview_list) {
+        if (ams_perview->IsSelected()) {
+            ams_id = ams_perview->get_ams_id();
+            break;
+        }
+    }
+
+    if (ams_id.empty())
+        return;
+
+    const bool is_rack_panel = curr_obj->GetNozzleRack()->IsDirectConnectedRack();
+    FilamentComboBoxList& active_list = is_rack_panel ? m_rack_filament_comboBox_list : m_filament_comboBox_list;
+    if (!curr_obj->GetFilaSystem()->IsVirtualTrayId(ams_id)) {
+        std::vector<CaliFilamentInfo> selected_filament;
+        size_t loop_n = is_rack_panel ? active_list.size() : static_cast<size_t>(MAX_SLOT_NUM);
+        for (size_t i = 0; i < loop_n; ++i) {
+            auto &fcb = active_list[i];
+            if (!fcb->GetRadioBox()->IsEnabled())
+                continue;
+            int tray_id = fcb->get_tray_id();
+            int nozzle_pos_id = fcb->GetNozzlePosId();
+            int extruder_id = fcb->GetExtuderRole() == ExtruderRole::DEPUTY_EXTRUDER ? DEPUTY_EXTRUDER_ID : MAIN_EXTRUDER_ID;
+            std::string nozzle_sn;
+            if (nozzle_pos_id != -1) {
+                DevNozzle nozzle = curr_obj->get_nozzle_by_id_code(nozzle_pos_id);
+                nozzle_sn        = nozzle.GetSerialNumber().ToStdString();
+            }
+            Preset* preset = const_cast<Preset *>(fcb->GetComboBox()->get_selected_preset());
+            if (m_cali_filament_mode == CalibrationFilamentMode::CALI_MODEL_SINGLE) {
+                selected_filament.clear();
+                CaliFilamentInfo info;
+                info.tray_id         = tray_id;
+                info.filament_preset = preset;
+                info.nozzle_pos_id   = nozzle_pos_id;
+                info.nozzle_sn       = nozzle_sn;
+                info.extruder_id     = extruder_id;
+                selected_filament.emplace_back(info);
+                if (preset && is_filaments_compatiable(selected_filament)) {
+                    fcb->GetRadioBox()->SetValue(true);
+                    wxCommandEvent event(wxEVT_TOGGLEBUTTON);
+                    event.SetEventObject(this);
+                    wxPostEvent(fcb->GetRadioBox(), event);
+                    Layout();
+                    break;
+                } else
+                    fcb->GetRadioBox()->SetValue(false);
+            } else if (m_cali_filament_mode == CalibrationFilamentMode::CALI_MODEL_MULITI) {
+                if (!preset) {
+                    fcb->GetCheckBox()->SetValue(false);
+                    continue;
+                }
+                if (!is_filaments_compatiable(selected_filament)) {
+                    fcb->GetCheckBox()->SetValue(false);
+                } else {
+                    selected_filament.emplace_back(CaliFilamentInfo(preset, nozzle_pos_id, nozzle_sn, extruder_id, tray_id));
+                    fcb->GetCheckBox()->SetValue(true);
+                }
+
+                wxCommandEvent event(wxEVT_CHECKBOX);
+                event.SetEventObject(this);
+                wxPostEvent(fcb->GetCheckBox(), event);
+                Layout();
+            }
+        }
+    }
+    else {
+        if (active_list.empty()) {
+            check_filament_compatible();
+            return;
+        }
+        auto* head = active_list[0];
+        CaliFilamentInfo selected_fila_info;
+        Preset  *preset  = const_cast<Preset *>(head->GetComboBox()->get_selected_preset());
+        int tray_id = head->get_tray_id();
+
+        selected_fila_info.tray_id         = tray_id;
+        selected_fila_info.filament_preset = preset;
+        selected_fila_info.nozzle_pos_id   = head->GetNozzlePosId();
+
+        std::string nozzle_sn;
+        if (selected_fila_info.nozzle_pos_id == -1) {
+            DevNozzle nozzle = curr_obj->get_nozzle_by_id_code(selected_fila_info.nozzle_pos_id);
+            nozzle_sn                    = nozzle.GetSerialNumber().ToStdString();
+        }
+        if (preset && is_filaments_compatiable({selected_fila_info})) {
+            head->GetRadioBox()->SetValue(true);
+        } else {
+            head->GetRadioBox()->SetValue(false);
+        }
+
+        wxCommandEvent event(wxEVT_TOGGLEBUTTON);
+        event.SetEventObject(this);
+        wxPostEvent(head->GetRadioBox(), event);
+        Layout();
+    }
+
+    check_filament_compatible();
+}
+
+int CalibrationPresetPage::get_index_by_extruder_tray_id(int extruder_id, int tray_id)
+{
+    auto selected_filaments = get_selected_filament_combobox();
+    auto it = std::find_if(selected_filaments.begin(), selected_filaments.end(), [extruder_id, tray_id](const SelectedFilamentInfo& info){
+        return info.extruder_id == extruder_id && info.tray_id == tray_id;
+    });
+
+    if (it != selected_filaments.end())
+        return it->model_index;
+    else
+        return -1;
+}
+
+std::vector<SelectedFilamentInfo> CalibrationPresetPage::get_selected_filament_combobox()
+{
+    std::vector<SelectedFilamentInfo> fcb_info_list;
+    if (!curr_obj) return fcb_info_list;
+
+    if (curr_obj->is_multi_extruders()) {
+        std::vector<FilamentComboBoxList*> lists = {&m_main_filament_comboBox_list, &m_deputy_filament_comboBox_list};
+        for (auto* listp : lists) {
+            if (m_cali_filament_mode == CalibrationFilamentMode::CALI_MODEL_MULITI) {
+                for (auto* fcb : *listp) {
+                    if (!fcb->GetCheckBox()->GetValue() || fcb->get_tray_id() < 0) continue;
+                    fcb_info_list.push_back(fcb->get_selected_filament_info());
+                }
+            } else if (m_cali_filament_mode == CalibrationFilamentMode::CALI_MODEL_SINGLE) {
+                for (auto* fcb : *listp) {
+                    if (!fcb || !fcb->GetRadioBox() || !fcb->GetRadioBox()->GetValue()) continue;
+                    if (!fcb->GetRadioBox()->IsEnabled() || fcb->get_tray_id() < 0) {
+                        fcb->SetValue(false);
+                        continue;
+                    }
+                    if (!fcb_info_list.empty()) {
+                        fcb->SetValue(false);
+                        continue;
+                    }
+                    fcb_info_list.push_back(fcb->get_selected_filament_info());
+                }
+            }
+        }
+    } else {
+        if (curr_obj->GetNozzleRack()->IsDirectConnectedRack()) {
+            for (auto* fcb : m_rack_filament_comboBox_list) {
+                auto* ext_fcb = dynamic_cast<FilamentExtendComboBox*>(fcb);
+                if (!ext_fcb || ext_fcb->get_tray_id() < 0) continue;
+
+                if (ext_fcb->IsSubAmsMode()) {
+                    for (const auto& [tray_id, info] : ext_fcb->GetSubAmsSelection()) {
+                        if (tray_id >= 0) fcb_info_list.push_back(info);
+                    }
+                } else {
+                    if (m_cali_filament_mode == CalibrationFilamentMode::CALI_MODEL_MULITI) {
+                        if (!ext_fcb->GetCheckBox()->GetValue()) continue;
+                        fcb_info_list.push_back(ext_fcb->get_selected_filament_info());
+                    } else if (m_cali_filament_mode == CalibrationFilamentMode::CALI_MODEL_SINGLE) {
+                        if (!ext_fcb->GetRadioBox()->GetValue()) continue;
+                        fcb_info_list.push_back(ext_fcb->get_selected_filament_info());
+                    }
+                }
+            }
+        } else {
+            if (m_cali_filament_mode == CalibrationFilamentMode::CALI_MODEL_MULITI) {
+                for (auto* fcb : m_filament_comboBox_list) {
+                    if (!fcb->GetCheckBox()->GetValue() || fcb->get_tray_id() < 0) continue;
+                    fcb_info_list.push_back(fcb->get_selected_filament_info());
+                }
+            } else if (m_cali_filament_mode == CalibrationFilamentMode::CALI_MODEL_SINGLE) {
+                for (auto* fcb : m_filament_comboBox_list) {
+                    if (!fcb->GetRadioBox()->GetValue() || fcb->get_tray_id() < 0) continue;
+                    if (!fcb->GetRadioBox()->IsEnabled()) { fcb->SetValue(false); continue; }
+                    fcb_info_list.push_back(fcb->get_selected_filament_info());
+                }
+            }
+        }
+    }
+
+    return fcb_info_list;
+}
+
+std::vector<CaliFilamentInfo> CalibrationPresetPage::get_selected_filaments()
+{
+    std::vector<CaliFilamentInfo> out;
+    if (!curr_obj || !curr_obj->GetNozzleSystem()) return out;
+
+    for (const auto& info : get_selected_filament_combobox()) {
+        std::string nozzle_sn;
+        if (info.nozzle_pos_id != -1) {
+            DevNozzle nozzle = curr_obj->get_nozzle_by_id_code(info.nozzle_pos_id);
+            nozzle_sn        = nozzle.GetSerialNumber().ToStdString();
+        }
+        out.emplace_back(CaliFilamentInfo(info.preset, info.nozzle_pos_id, nozzle_sn, info.extruder_id, info.tray_id));
+    }
+    return out;
+}
+
+void CalibrationPresetPage::get_preset_info(float& nozzle_dia, BedType& plate_type)
+{
+    auto sel = m_comboBox_nozzle_dia->GetSelection();
+    if (sel != wxNOT_FOUND) {
+        auto diameter = NozzleDiameterType(*(int*)m_comboBox_nozzle_dia->GetClientData(sel));
+        nozzle_dia = DevNozzle::ToNozzleDiameterFloat(diameter);
+    } else {
+        nozzle_dia = -1.0f;
+    }
+
+    if (m_comboBox_bed_type->GetSelection() >= 0)
+        plate_type = static_cast<BedType>(m_displayed_bed_types[m_comboBox_bed_type->GetSelection()]);
+}
+
+void CalibrationPresetPage::get_cali_stage(CaliPresetStage& stage, float& value)
+{
+    m_cali_stage_panel->get_cali_stage(stage, value);
+
+    if (stage != CaliPresetStage::CALI_MANUAL_STAGE_2) {
+        std::vector<CaliFilamentInfo> selected_filaments = get_selected_filaments();
+        if (!selected_filaments.empty()) {
+            Preset* preset = selected_filaments.begin()->filament_preset;
+            const ConfigOptionFloatsNullable* flow_ratio_opt = preset ? preset->config.option<ConfigOptionFloatsNullable>("filament_flow_ratio") : nullptr;
+            if (flow_ratio_opt) {
+                m_cali_stage_panel->set_flow_ratio_value(flow_ratio_opt->get_at(0));
+                value = flow_ratio_opt->get_at(0);
+                BOOST_LOG_TRIVIAL(info) << "set flow ratio value:" << value;
+            }
+            else {
+                BOOST_LOG_TRIVIAL(warning) << "selected filament preset has no flow ratio option";
+            }
+        } else {
+            BOOST_LOG_TRIVIAL(warning) << "no filament selected, can't set flow ratio value";
+        }
+    }
+}
+
+// render an ams info to ui by ams_id
+void CalibrationPresetPage::update_slots_panel(FilamentComboBoxList& fila_combox_list, const std::string& ams_id, std::map<int, DynamicPrintConfig>& fila_ams_list)
+{
+    if (!curr_obj) return;
+
+    int int_ams_id = -1;
+    try {
+        int_ams_id = std::stoi(ams_id);
+    } catch(...) {
+        BOOST_LOG_TRIVIAL(error) << "invalid " << KV(log_key::ams_id, ams_id);
+        return;
+    }
+
+    int slot_size = MAX_SLOT_NUM;
+    auto ams_item = curr_obj->GetFilaSystem()->GetAmsById(ams_id);
+    if (ams_item) {
+        slot_size = ams_item->GetSlotCount();
+    } else if (curr_obj->GetFilaSystem()->IsVirtualTrayId(ams_id)) {
+        slot_size = 1;
+    }
+
+    for (int slot_id = 0; slot_id < MAX_SLOT_NUM; slot_id++) {
+        fila_combox_list[slot_id]->SetValue(false);
+        if (slot_id < slot_size) {
+            fila_combox_list[slot_id]->ShowPanel();
+        } else {
+            fila_combox_list[slot_id]->HidePanel();
+        }
+
+        int tray_index = curr_obj->GetFilaSystem()->GetTrayIdByAmsSlotId(int_ams_id, slot_id);
+
+        if (!fila_combox_list.empty()) {
+            auto it = std::find_if(fila_ams_list.begin(), fila_ams_list.end(), [tray_index](auto &entry) { return entry.first == tray_index; });
+            if (it != fila_ams_list.end()) {
+                fila_combox_list[slot_id]->load_tray_from_ams(tray_index, it->second);
+            } else {
+                fila_combox_list[slot_id]->load_tray_from_ams(tray_index, get_empty_dynamic_print_config());
+            }
+        }
+    }
+}
+
+void CalibrationPresetPage::update_rack_filament_combobox(MachineObject* obj)
+{
+    if (!obj) return;
+
+    auto rack = obj->GetNozzleRack();
+    if (!rack->IsDirectConnectedRack()) return;
+
+    for (int i = 0; i < (int)m_rack_filament_comboBox_list.size(); ++i) {
+        auto* fcb = dynamic_cast<FilamentExtendComboBox*>(m_rack_filament_comboBox_list[i]);
+        if (!fcb) continue;
+
+        if (i < rack->GetTotalRackNozzleCount()) {
+            DevNozzle nozzle;
+            if (auto opt_nozzle = obj->GetNozzleSystem()->GetNozzleOptByAddrId(i); opt_nozzle.has_value()) {
+                nozzle = opt_nozzle.value();
+            } else {
+                BOOST_LOG_TRIVIAL(warning) << "rack nozzle addr_id:" << i << " not found in nozzle system";
+            }
+
+            // Per-slot nozzle: rack slots can hold different diameters than the machine default.
+            if (Preset* printer_preset = get_printer_preset(obj, nozzle.GetNozzleDiameter()))
+                fcb->GetComboBox()->set_calibrate_filaments(get_calibrate_filament_names(printer_preset->name));
+
+            fcb->update_from_preset();
+            fcb->set_select_mode(m_cali_filament_mode);
+            fcb->SetNozzleInfo(nozzle, obj);
+
+            /* use nozzole first ams_slot if multiple ams_slot binded, as they share the same filament config */
+            for (const auto& ams_slot_id : nozzle.GetBindAmsSlots()) {
+                int tray_id = obj->GetFilaSystem()->GetTrayIdByAmsSlotId(ams_slot_id.first, ams_slot_id.second);
+                if (auto ams_it = m_filament_ams_list.find(tray_id); ams_it != m_filament_ams_list.end()) {
+                    fcb->load_tray_from_ams(tray_id, ams_it->second);
+                } else {
+                    fcb->load_tray_from_ams(tray_id, get_empty_dynamic_print_config());
+                }
+            }
+
+            /* No bound slot: still feed an empty config so clr_picker has a bitmap. */
+            if (nozzle.GetBindAmsSlots().empty()) fcb->load_tray_from_ams( -1, get_empty_dynamic_print_config());
+
+            /* set subams popup: union of directly-bound, preload-bound and external AMS slots. std::set<DevAmsSlotId> dedups and sorts by (ams_id, slot_id). */
+            std::set<DevAmsSlotId> slot_set;
+            if (auto fila_sys = obj->GetFilaSystem()) {
+                for (const auto& s : nozzle.GetBindAmsSlots())        slot_set.insert(s);
+                for (const auto& s : nozzle.GetPreloadBindAmsSlots()) slot_set.insert(s);
+                for (int ams_id : nozzle.GetBindAms()) {
+                    int slot_size = 0;
+                    if (auto* ams = fila_sys->GetAmsById(std::to_string(ams_id))) {
+                        slot_size = ams->GetSlotCount();
+                    } else if (fila_sys->IsVirtualTrayId(std::to_string(ams_id))) {
+                        slot_size = 1;
+                    }
+                    for (int slot = 0; slot < slot_size; ++slot) slot_set.insert({ams_id, slot});
+                }
+            }
+
+            const bool nozzle_selectable = (nozzle.IsExist() || nozzle.IsOnRack()) && nozzle.IsNormal() && nozzle.IsHotend();
+
+            /* Only offer the popup when there is more than one slot to choose from;
+               a single (or no) slot stays on the inline combobox. */
+            if (slot_set.size() > 1) {
+                // Rack data refreshed: drop stale sub-AMS picks; user must re-select.
+                fcb->ClearSubAmsSelection();
+                fcb->SetSubAmsMode(true, _L("Not Selected"));
+                /* Cache the slot set on the owner; the shared popup is filled lazily on click. */
+                fcb->SetSubAmsSlotSet(slot_set);
+                fcb->Enable(nozzle_selectable);
+            } else {
+                fcb->SetSubAmsMode(false);
+                fcb->SetSubAmsSlotSet({});  // no popup for this slot; drop any stale cache
+                fcb->Enable(nozzle_selectable && fcb->GetComboBox()->is_tray_exist() && fcb->GetComboBox()->is_compatible_with_printer());
+            }
+
+            fcb->Show();
+        } else {
+            fcb->Hide();
+            fcb->Enable(false);
+            if (auto* radio = fcb->GetRadioBox()) radio->Hide();
+            if (auto* check = fcb->GetCheckBox()) check->Hide();
+        }
+    }
+
+    /* Single authority for model index addressing once availability is decided. */
+    assign_rack_model_indices();
+
+    /* Default-select first enabled slot */
+
+    m_rack_nozzle_panel->Layout();
+}
+
+void CalibrationPresetPage::assign_rack_model_indices()
+{
+    /* Walk rack nozzles in order with one shared running counter so model indices stay
+       continuous across direct slots and every per-nozzle sub-AMS group. Indices are computed
+       purely from data (no live popup rows needed): direct slots store the index on the ext_fcb;
+       sub-AMS slots store a per-tray index on the owner, which SubAmsPopup::SetData() reads back
+       onto the row when the shared popup is opened. Beyond the template capacity indices are -1. */
+    auto fila_sys = curr_obj ? curr_obj->GetFilaSystem() : nullptr;
+    int running = 0;
+    for (auto* fcb : m_rack_filament_comboBox_list) {
+        auto* ext = dynamic_cast<FilamentExtendComboBox*>(fcb);
+        if (!ext || !ext->IsShown()) continue;
+        if (ext->IsSubAmsMode()) {
+            /* Mirror SubAmsPopup::SetData row order/filter: iterate the cached slot set (sorted by
+               (ams_id, slot_id)); only slots whose tray_id exists in m_filament_ams_list become rows,
+               and only those advance the counter. */
+            ext->ClearSubAmsModelIndex();
+            if (!fila_sys) continue;
+            for (const auto& [ams_id, slot_id] : ext->GetSubAmsSlotSet()) {
+                int tray_id = fila_sys->GetTrayIdByAmsSlotId(ams_id, slot_id);
+                if (m_filament_ams_list.find(tray_id) == m_filament_ams_list.end()) continue;
+                ext->SetSubAmsModelIndex(tray_id, running < MAX_AUTO_PA_CALI_OBJECTS ? running++ : -1);
+            }
+        } else if (ext->get_tray_id() >= 0) {
+            ext->set_index(running < MAX_AUTO_PA_CALI_OBJECTS ? running++ : -1);
+        }
+    }
+}
+
+void CalibrationPresetPage::update_extruder_filament_combobox(ExtruderRole role, const std::string &ams_id)
+{
+    if (!curr_obj)
+        return;
+
+    std::map<ExtruderRole, FilamentComboBoxList*> filament_combox_map{
+        {ExtruderRole::SINGLE_EXTRUDER, &m_filament_comboBox_list},
+        {ExtruderRole::MAIN_EXTRUDER,   &m_main_filament_comboBox_list},
+        {ExtruderRole::DEPUTY_EXTRUDER, &m_deputy_filament_comboBox_list}
+    };
+
+    std::map<ExtruderRole, std::vector<AMSPreview *>*> ams_prevew_map{
+        {ExtruderRole::SINGLE_EXTRUDER, &m_single_ams_preview_list},
+        {ExtruderRole::MAIN_EXTRUDER,   &m_main_ams_preview_list},
+        {ExtruderRole::DEPUTY_EXTRUDER, &m_deputy_ams_preview_list}
+    };
+
+    // Must precede update_from_preset(): CalibrateFilamentComboBox::update() filters by these names.
+    {
+        int extruder_id = role == ExtruderRole::DEPUTY_EXTRUDER ? DEPUTY_EXTRUDER_ID : MAIN_EXTRUDER_ID;
+        Preset* printer_preset = get_printer_preset(curr_obj, get_nozzle_diameter(extruder_id));
+        const std::set<std::string>& names = get_calibrate_filament_names(printer_preset ? printer_preset->name : "");
+        for (auto* fcb : *filament_combox_map[role]) {
+            if (fcb) fcb->GetComboBox()->set_calibrate_filaments(names);
+        }
+    }
+
+    for (auto &fcb : *filament_combox_map[role]) {
+        fcb->update_from_preset();
+        fcb->set_select_mode(m_cali_filament_mode);
+    }
+
+    for (auto item : *ams_prevew_map[role]) {
+        if (item->get_ams_id() == ams_id) {
+            item->OnSelected();
+        } else {
+            item->UnSelected();
+        }
+    }
+
+    if (m_filament_ams_list.empty())
+        return;
+    else
+        update_slots_panel(*filament_combox_map[role], ams_id, m_filament_ams_list);
+
+    Layout();
+}
+
+Preset* CalibrationPresetPage::get_printer_preset(MachineObject* obj, float nozzle_value)
+{
+    if (!obj) return nullptr;
+
+    Preset* printer_preset = nullptr;
+    PresetBundle* preset_bundle = wxGetApp().preset_bundle;
+    for (auto printer_it = preset_bundle->printers.begin(); printer_it != preset_bundle->printers.end(); printer_it++) {
+        // only use system printer preset
+        if (!printer_it->is_system) continue;
+
+        ConfigOption* printer_nozzle_opt = printer_it->config.option("nozzle_diameter");
+        ConfigOptionFloatsNullable *printer_nozzle_vals = nullptr;
+        if (printer_nozzle_opt)
+            printer_nozzle_vals = dynamic_cast<ConfigOptionFloatsNullable*>(printer_nozzle_opt);
+        std::string model_id = printer_it->get_current_printer_type(preset_bundle);
+
+        std::string printer_type = obj->printer_type;
+        if (obj->is_support_upgrade_kit && obj->installed_upgrade_kit) { printer_type = "C12"; }
+        if (model_id.compare(printer_type) == 0
+            && printer_nozzle_vals
+            && abs(printer_nozzle_vals->get_at(0) - nozzle_value) < 1e-3) {
+            printer_preset = &(*printer_it);
+        }
+    }
+
+    if (!printer_preset) {
+        BOOST_LOG_TRIVIAL(warning) << "no matching system printer preset, printer_type="
+                                   << obj->printer_type << " nozzle_value=" << nozzle_value;
+    }
+
+    return printer_preset;
+}
+
+Preset* CalibrationPresetPage::get_print_preset(float nozzle_value)
+{
+    Preset* printer_preset = get_printer_preset(curr_obj, nozzle_value);
+
+    Preset* print_preset = nullptr;
+    wxArrayString print_items;
+
+    // get default print profile
+    std::string default_print_profile_name;
+    if (printer_preset && printer_preset->config.has("default_print_profile")) {
+        default_print_profile_name = printer_preset->config.opt_string("default_print_profile");
+    }
+
+    PresetBundle* preset_bundle = wxGetApp().preset_bundle;
+    if (preset_bundle) {
+        for (auto print_it = preset_bundle->prints.begin(); print_it != preset_bundle->prints.end(); print_it++) {
+            if (print_it->name == default_print_profile_name) {
+                print_preset = &(*print_it);
+                BOOST_LOG_TRIVIAL(trace) << "CaliPresetPage: get_print_preset = " << print_preset->name;
+            }
+        }
+    }
+
+    if (!print_preset) {
+        BOOST_LOG_TRIVIAL(warning) << "null, printer_preset=" << (printer_preset ? "found" : "null")
+                                   << " default_print_profile=\"" << default_print_profile_name << "\"";
+    }
+
+    return print_preset;
+}
+
+std::string CalibrationPresetPage::get_print_preset_name(float nozzle_value)
+{
+    Preset* print_preset = get_print_preset(nozzle_value);
+    if (print_preset)
+        return print_preset->name;
+    return "";
+}
+
+wxArrayString CalibrationPresetPage::get_custom_range_values()
+{
+    if (m_custom_range_panel) {
+        return m_custom_range_panel->get_values();
+    }
+    return wxArrayString();
+}
+
+CalibMode CalibrationPresetPage::get_pa_cali_method()
+{
+    if (m_pa_cali_method_combox) {
+        int selected_mode = m_pa_cali_method_combox->get_selection();
+        if (selected_mode == PA_LINE) {
+            return CalibMode::Calib_PA_Line;
+        }
+        else if (selected_mode == PA_PATTERN) {
+            return CalibMode::Calib_PA_Pattern;
+        }
+    }
+    return CalibMode::Calib_PA_Line;
+}
+
+MaxVolumetricSpeedPresetPage::MaxVolumetricSpeedPresetPage(
+    wxWindow *parent, CalibMode cali_mode, bool custom_range, wxWindowID id, const wxPoint &pos, const wxSize &size, long style)
+    : CalibrationPresetPage(parent, cali_mode, custom_range, id, pos, size, style)
+{
+    if (custom_range && m_custom_range_panel) {
+        wxArrayString titles;
+        titles.push_back(_L("From Volumetric Speed"));
+        titles.push_back(_L("To Volumetric Speed"));
+        titles.push_back(_L("Step"));
+        m_custom_range_panel->set_titles(titles);
+
+        m_custom_range_panel->set_unit("mm³/s");
+    }
+}
+
+wxDEFINE_EVENT(EVT_SUBAMS_RADIO_SELECTED, wxCommandEvent);
+
+// -------------------- SubAmsPopup --------------------
+
+/* Row/scroll metrics of SubAmsPopup. They are applied when the pool is built and must be
+   re-applied on DPI change, so both places read the same macro instead of a literal. */
+#define SUBAMS_ROW_BOTTOM_GAP   FromDIP(5)
+#define SUBAMS_CHECK_GAP        FromDIP(8)
+#define SUBAMS_SCROLL_PADDING   FromDIP(4)
+#define SUBAMS_SCROLL_RATE      FromDIP(10)
+
+SubAmsPopup::SubAmsPopup(wxWindow* parent)
+    : PopupWindow(parent, wxBORDER_NONE | wxPU_CONTAINS_CONTROLS)
+{
+    SetBackgroundColour(*wxWHITE);
+    Bind(wxEVT_PAINT, [this](auto&) {
+        wxPaintDC dc(this);
+        dc.SetPen({ 0xACACAC });
+        dc.SetBrush(*wxTRANSPARENT_BRUSH);
+        dc.DrawRectangle({ 0, 0 }, GetSize());
+    });
+
+    auto* root = new wxBoxSizer(wxVERTICAL);
+    m_scroll = new wxScrolledWindow(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                                    wxVSCROLL | wxBORDER_NONE);
+    m_scroll->SetBackgroundColour(*wxWHITE);
+#ifdef __WXOSX__
+    m_scroll->Bind(wxEVT_LEFT_UP, &SubAmsPopup::OnLeftUpOSX, this);
+#endif
+
+    m_list_sizer = new wxBoxSizer(wxVERTICAL);
+    m_scroll->SetSizer(m_list_sizer);
+
+    /* Pre-create a fixed pool of rows; SetData only updates data and toggles visibility. */
+    constexpr int POOL_SIZE = 18;
+    for (int i = 0; i < POOL_SIZE; ++i) {
+        auto* row       = new wxBoxSizer(wxHORIZONTAL);
+        auto* radio_btn = new RadioBox(m_scroll);
+        radio_btn->SetBackgroundColour(*wxWHITE);
+
+        auto* check_box = new CheckBox(m_scroll);
+        check_box->SetBackgroundColour(*wxWHITE);
+
+        auto* fcb = new FilamentComboBox(m_scroll);
+        fcb->SetChipSize(CALIBRATION_FILAMENT_CHIP_SIZE);
+        fcb->SetBackgroundColour(*wxWHITE);
+        fcb->SetRadioBox(radio_btn);
+        fcb->SetCheckBox(check_box);
+        if (auto* combo = fcb->GetComboBox()) {
+            combo->Bind(wxEVT_COMBOBOX_DROPDOWN, [this](wxCommandEvent& evt) {
+                m_combo_dropdown_open = true;
+                evt.Skip();
+            });
+            combo->Bind(wxEVT_COMBOBOX_CLOSEUP, [this](wxCommandEvent& evt) {
+                m_combo_dropdown_open = false;
+                evt.Skip();
+            });
+        }
+
+        /* Persist selection to the owning FilamentExtendComboBox and notify the page on radio click
+           so it can enforce page-wide single-selection. tray_id lives on the fcb itself
+           (set by load_tray_from_ams in SetData; reset to -1 for unused rows). */
+        radio_btn->Bind(wxEVT_TOGGLEBUTTON, [this, fcb](wxCommandEvent& evt) {
+            if (!m_owner) return;
+            const int tray_id = fcb->get_tray_id();
+            if (tray_id < 0) return;
+            /* SINGLE: keep only this snapshot; nozzle_sn resolved later from MachineObject. */
+            SelectedFilamentInfo info = fcb->get_selected_filament_info();
+            info.nozzle_pos_id = m_owner->GetNozzlePosId();  // row fcb has no combo; pos id comes from the owning ext_fcb
+
+            m_owner->ClearSubAmsSelection(false);
+            m_owner->SetSubAmsSelected(tray_id, info, fcb->GetComboBox());
+            m_owner->RefreshSubAmsLabel(_L("Not Selected"));
+            // Mirror selection on parent ext_fcb so it counts as picked at page level.
+            m_owner->SetValue(true, /*send_event=*/false);
+
+            /* RadioBox does not auto-mutex like wxRadioButton; paint the clicked row on. */
+            for (auto* other : m_fcb_list) {
+                if (!other || !other->GetRadioBox()) continue;
+                other->GetRadioBox()->SetValue(other == fcb);
+            }
+
+            wxCommandEvent sel_evt(EVT_SUBAMS_RADIO_SELECTED);
+            sel_evt.SetEventObject(m_owner);
+            sel_evt.SetInt(tray_id);
+            wxPostEvent(m_owner, sel_evt);
+
+            // Popup events never reach the page; re-check compatibility via the owner (queued after sel_evt).
+            wxCommandEvent tray_evt(EVT_CALI_TRAY_CHANGED);
+            tray_evt.SetEventObject(m_owner);
+            wxPostEvent(m_owner, tray_evt);
+            evt.Skip();
+        });
+        check_box->Bind(wxEVT_TOGGLEBUTTON, [this, fcb, check_box](wxCommandEvent& evt) {
+            if (!m_owner) return;
+            const int tray_id = fcb->get_tray_id();
+            if (tray_id < 0) return;
+            if (check_box->GetValue()) {
+                SelectedFilamentInfo info = fcb->get_selected_filament_info();
+                info.nozzle_pos_id = m_owner->GetNozzlePosId();  // row fcb has no combo; pos id comes from the owning ext_fcb
+                m_owner->SetSubAmsSelected(tray_id, info, fcb->GetComboBox());
+            } else {
+                m_owner->ClearSubAmsSelected(tray_id);
+            }
+            m_owner->RefreshSubAmsLabel(_L("Not Selected"));
+            // Parent ext_fcb tracks "any sub-AMS row picked" in MULITI mode.
+            m_owner->SetValue(!m_owner->GetSubAmsSelection().empty(), /*send_event=*/false);
+
+            wxCommandEvent tray_evt(EVT_CALI_TRAY_CHANGED);
+            tray_evt.SetEventObject(m_owner);
+            wxPostEvent(m_owner, tray_evt);
+            evt.Skip();
+        });
+#ifdef __WXOSX__
+        /* Neither TOGGLEBUTTON handler above ever fires inside a popup on mac; drive them from LEFT_DOWN. */
+        radio_btn->Bind(wxEVT_LEFT_DOWN, [this, radio_btn](wxMouseEvent& evt) { if (!TryToggleOSX(radio_btn)) evt.Skip(); });
+        check_box->Bind(wxEVT_LEFT_DOWN, [this, check_box](wxMouseEvent& evt) { if (!TryToggleOSX(check_box)) evt.Skip(); });
+#endif
+        fcb->Bind(EVT_CALI_TRAY_CHANGED, [this, fcb](wxCommandEvent&) {
+            if (!m_owner) return;
+            m_combo_dropdown_open = false;
+            const int tray_id = fcb->get_tray_id();
+            if (tray_id < 0 || !m_owner->GetSubAmsSelected(tray_id)) return;
+
+            SelectedFilamentInfo info = fcb->get_selected_filament_info();
+            info.nozzle_pos_id = m_owner->GetNozzlePosId();  // row fcb has no combo; pos id comes from the owning ext_fcb
+            m_owner->SetSubAmsSelected(tray_id, info, fcb->GetComboBox());
+            m_owner->RefreshSubAmsLabel(_L("Not Selected"));
+
+            wxCommandEvent tray_evt(EVT_CALI_TRAY_CHANGED);
+            tray_evt.SetEventObject(m_owner);
+            wxPostEvent(m_owner, tray_evt);
+        });
+
+        row->Add(radio_btn, 0, wxALIGN_CENTER);
+        row->Add(check_box, 0, wxALIGN_CENTER | wxRIGHT, SUBAMS_CHECK_GAP);
+        row->Add(fcb,       0, wxALIGN_CENTER);
+
+        m_list_sizer->Add(row, 0, wxBOTTOM, SUBAMS_ROW_BOTTOM_GAP);
+
+        radio_btn->Hide();
+        check_box->Hide();
+        fcb->Hide();
+
+        m_fcb_list.push_back(fcb);
+    }
+
+    root->Add(m_scroll, 1, wxEXPAND | wxALL, SUBAMS_SCROLL_PADDING);
+    SetSizer(root);
+
+    /* The popup is its own top-level HWND: crossing monitors rescales it by the DPI ratio, not to
+       the anchor width. Rescale rows now; re-fit after wx has applied its suggested rect. */
+    Bind(wxEVT_DPI_CHANGED, [this](wxDPIChangedEvent& evt) {
+        evt.Skip();
+        msw_rescale();
+        CallAfter([this] {
+            if (IsShown() && m_owner) FitToAnchor(m_owner->GetSubAmsPanel());
+        });
+    });
+
+    wxGetApp().UpdateDarkUIWin(this);
+}
+
+void SubAmsPopup::Dismiss()
+{
+    if (m_combo_dropdown_open)
+        return;
+
+    PopupWindow::Dismiss();
+    /* Shared popup: drop the owner link so a stale pointer can't leak into the next open. */
+    m_owner = nullptr;
+#ifdef __WXOSX__
+    m_osx_last_click.clear();
+    if (wxTheApp && m_activate_app_bound) {
+        wxTheApp->Unbind(wxEVT_ACTIVATE_APP, &SubAmsPopup::OnActivateAppOSX, this);
+        m_activate_app_bound = false;
+    }
+#endif
+}
+
+void SubAmsPopup::SetData(MachineObject* obj,
+                          const std::map<int, DynamicPrintConfig>& fila_ams_list,
+                          CalibrationFilamentMode mode,
+                          FilamentExtendComboBox* owner,
+                          const std::set<DevAmsSlotId>& slots)
+{
+    if (!obj) return;
+
+    m_owner = owner;
+    const std::set<std::string> cali_names = owner && owner->GetComboBox() ? owner->GetComboBox()->get_calibrate_filaments() : std::set<std::string>{};
+    /* Collect (tray_id, cfg) entries for the given slots; std::set already sorted
+       by (ams_id, slot_id), so rows follow that order. */
+    std::vector<std::pair<int, const DynamicPrintConfig*>> rows;
+    if (auto fila_sys = obj->GetFilaSystem()) {
+        for (const auto& [ams_id, slot_id] : slots) {
+            int tray_id = fila_sys->GetTrayIdByAmsSlotId(ams_id, slot_id);
+            if (auto it = fila_ams_list.find(tray_id); it != fila_ams_list.end()) {
+                rows.emplace_back(it->first, &it->second);
+            }
+        }
+    }
+
+    /* Model indices are assigned later by CalibrationPresetPage::assign_rack_model_indices()
+       so they stay continuous across rack slots and all per-nozzle popups. */
+
+    /* Update the pre-created pool: fill the first N rows, hide the rest. */
+    for (size_t i = 0; i < m_fcb_list.size(); ++i)
+    {
+        auto* fcb = m_fcb_list[i];
+        if (i < std::min(rows.size(), m_fcb_list.size())) {
+            const int tray_id = rows[i].first;
+            fcb->GetComboBox()->set_calibrate_filaments(cali_names);
+            fcb->update_from_preset();
+            fcb->load_tray_from_ams(tray_id, *rows[i].second);
+            /* set_select_mode toggles the radio/checkbox visibility per mode. */
+            fcb->set_select_mode(mode);
+            /* Restore the data-side model index (assigned by assign_rack_model_indices) onto the row
+               so write-back callbacks embed the correct index. */
+            fcb->set_index(m_owner ? m_owner->GetSubAmsModelIndex(tray_id) : -1);
+            /* Restore previous selection from the owner (per-nozzle memory). */
+            const bool prev_sel = m_owner ? m_owner->GetSubAmsSelected(tray_id) : false;
+            fcb->SetValue(prev_sel, /*send_event=*/false);
+            fcb->Show(true);
+        } else {
+            fcb->load_tray_from_ams(-1, get_empty_dynamic_print_config());
+            fcb->GetRadioBox()->Hide();
+            fcb->GetCheckBox()->Hide();
+            fcb->Show(false);
+        }
+    }
+
+    m_scroll->SetScrollRate(0, SUBAMS_SCROLL_RATE);
+    m_scroll->FitInside();
+    m_scroll->Layout();
+    Layout();
+}
+
+#ifdef __WXOSX__
+
+bool SubAmsPopup::TryToggleOSX(wxBitmapToggleButton* btn)
+{
+    if (!btn || !btn->IsShown() || !btn->IsEnabled()) return false;
+
+    /* Per-control debounce: one shared timestamp would swallow consecutive checkbox picks in MULTI mode. */
+    const auto now  = std::chrono::steady_clock::now();
+    auto&      last = m_osx_last_click[btn];
+    if (now - last < std::chrono::milliseconds(300)) return true;
+    last = now;
+
+    /* radio: a click always selects (the TOGGLEBUTTON handler repaints the mutex); checkbox flips. */
+    const bool value = dynamic_cast<RadioBox*>(btn) ? true : !btn->GetValue();
+    btn->SetValue(value);
+
+    wxCommandEvent sel_evt(wxEVT_TOGGLEBUTTON, btn->GetId());
+    sel_evt.SetEventObject(btn);
+    sel_evt.SetInt(value ? 1 : 0);
+    btn->ProcessWindowEvent(sel_evt);
+    return true;
+}
+
+void SubAmsPopup::OnActivateAppOSX(wxActivateEvent& evt)
+{
+    evt.Skip();
+    if (!evt.GetActive() && IsShown())
+        Dismiss();
+}
+
+void SubAmsPopup::OnLeftUpOSX(wxMouseEvent& evt)
+{
+    /* Screen coords rather than PopupWindow::HitTest, which uses GetPosition() and drifts once the NSScrollView scrolls. */
+    const wxPoint screen_pt = m_scroll->ClientToScreen(evt.GetPosition());
+    for (auto* fcb : m_fcb_list) {
+        if (!fcb || !fcb->IsShown()) continue;
+        for (wxBitmapToggleButton* btn : {static_cast<wxBitmapToggleButton*>(fcb->GetRadioBox()),
+                                          static_cast<wxBitmapToggleButton*>(fcb->GetCheckBox())}) {
+            if (!btn || !btn->IsShown()) continue;
+            if (wxRect(btn->ClientToScreen(wxPoint(0, 0)), btn->GetSize()).Contains(screen_pt) && TryToggleOSX(btn))
+                return;
+        }
+    }
+    evt.Skip();
+}
+
+#endif // __WXOSX__
+
+void SubAmsPopup::ClearAllRadioVisuals()
+{
+    /* Clear radio state for every visible row without firing events. */
+    for (size_t i = 0; i < m_fcb_list.size(); ++i) {
+        auto* fcb = m_fcb_list[i];
+        if (auto* rb = fcb->GetRadioBox()) rb->SetValue(false);
+    }
+}
+
+void SubAmsPopup::msw_rescale()
+{
+    for (auto* fcb : m_fcb_list) {
+        fcb->msw_rescale();
+        fcb->SetChipSize(CALIBRATION_FILAMENT_CHIP_SIZE);
+    }
+
+    /* A sizer border is resolved to pixels in Add(), so it still holds the old-DPI value;
+       re-apply the same macros the constructor used. */
+    size_t row_idx = 0;
+    for (wxSizerItem* row_item : m_list_sizer->GetChildren()) {
+        row_item->SetBorder(SUBAMS_ROW_BOTTOM_GAP);
+
+        wxSizer* row = row_item->GetSizer();
+        if (row && row_idx < m_fcb_list.size()) {
+            if (wxSizerItem* check_item = row->GetItem(m_fcb_list[row_idx]->GetCheckBox()))
+                check_item->SetBorder(SUBAMS_CHECK_GAP);
+        }
+        ++row_idx;
+    }
+    if (wxSizerItem* scroll_item = GetSizer()->GetItem(m_scroll))
+        scroll_item->SetBorder(SUBAMS_SCROLL_PADDING);
+
+    m_scroll->SetScrollRate(0, SUBAMS_SCROLL_RATE);
+    m_scroll->FitInside();
+    m_scroll->Layout();
+
+    if (IsShown() && m_owner)
+        FitToAnchor(m_owner->GetSubAmsPanel());
+    Refresh();
+}
+
+void SubAmsPopup::FitToAnchor(wxWindow* anchor)
+{
+    /* Move first: landing on a monitor with another DPI fires WM_DPICHANGED, which must not
+       override the size computed below. */
+    if (anchor)
+        SetPosition(anchor->ClientToScreen(wxPoint(0, anchor->GetSize().GetHeight())));
+
+    /* width strictly matches anchor (subams panel); height auto-fits content, capped. */
+    const int max_h = FromDIP(400);
+
+    wxSize content = m_list_sizer->GetMinSize();
+    int desired_h = content.GetHeight() + FromDIP(12);
+    int height = (desired_h < max_h) ? desired_h : max_h;
+    if (height < FromDIP(60)) height = FromDIP(60);
+
+    int width = anchor ? anchor->GetSize().GetWidth() : (content.GetWidth() + FromDIP(20));
+    if (width <= 0) width = content.GetWidth() + FromDIP(20);
+
+    m_scroll->SetMinSize(wxSize(width - FromDIP(12), height - FromDIP(12)));
+    SetClientSize(wxSize(width, height));
+    Layout();
+}
+
+void SubAmsPopup::PopupAt(wxWindow* anchor)
+{
+    FitToAnchor(anchor);
+
+#ifdef __WXOSX__
+    if (wxTheApp && !m_activate_app_bound) {
+        wxTheApp->Bind(wxEVT_ACTIVATE_APP, &SubAmsPopup::OnActivateAppOSX, this);
+        m_activate_app_bound = true;
+    }
+#endif
+
+    Popup();
+}
+
+}}
