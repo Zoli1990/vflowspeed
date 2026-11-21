@@ -52,7 +52,8 @@ bambustudio_add_cmake_project(Boost
     URL "https://github.com/boostorg/boost/releases/download/boost-1.84.0/boost-1.84.0.tar.gz"
     URL_HASH SHA256=4d27e9efed0f6f152dc28db6430b9d3dfb40c0345da7342eaa5a987dde57bd95
     LIST_SEPARATOR |
-    PATCH_COMMAND git apply --verbose --ignore-space-change --whitespace=fix
+    PATCH_COMMAND ${CMAKE_COMMAND} -E chdir <SOURCE_DIR>
+        git apply --verbose --ignore-space-change --whitespace=fix
         ${CMAKE_CURRENT_LIST_DIR}/0001-FIX-OBS-cannot-start-streaming-on-MAC.patch
         ${CMAKE_CURRENT_LIST_DIR}/0002-Boost-locale-source-group.patch
     CMAKE_ARGS
