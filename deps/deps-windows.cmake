@@ -62,6 +62,13 @@ else ()
     endif ()
 endif ()
 
+# Use the exact generator selected for this build in nested ExternalProject
+# builds. CMake requires versioned Visual Studio names such as
+# "Visual Studio 17 2022", not the toolset shorthand "Visual Studio 17".
+if (CMAKE_GENERATOR MATCHES "^Visual Studio ")
+    set(DEP_MSVC_GEN "${CMAKE_GENERATOR}")
+endif ()
+
 set(DEP_CMAKE_OPTS "-DCMAKE_POLICY_VERSION_MINIMUM=3.5")
 if (DEP_PLATFORM STREQUAL "ARM64")
     list(APPEND DEP_CMAKE_OPTS "-DCMAKE_SYSTEM_PROCESSOR=ARM64")

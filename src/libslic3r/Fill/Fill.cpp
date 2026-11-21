@@ -66,9 +66,9 @@ struct SurfaceFillParams
 	// Index of this entry in a linear vector.
     size_t 			idx = 0;
 	// infill speed settings
-	float			sparse_infill_speed = 0;
-	float			top_surface_speed = 0;
-	float			solid_infill_speed = 0;
+	FloatOrPercent	sparse_infill_speed;
+	FloatOrPercent	top_surface_speed;
+	FloatOrPercent	solid_infill_speed;
 	float			bridge_speed = 0;
     float           initial_layer_flow_ratio    = 1.f;
     float           infill_shift_step          = 0;// param for cross zag
@@ -110,9 +110,9 @@ struct SurfaceFillParams
 		RETURN_COMPARE_NON_EQUAL_TYPED(unsigned, bridge);
 		RETURN_COMPARE_NON_EQUAL_TYPED(unsigned, extrusion_role);
 		RETURN_COMPARE_NON_EQUAL(initial_layer_flow_ratio);
-		RETURN_COMPARE_NON_EQUAL(sparse_infill_speed);
-		RETURN_COMPARE_NON_EQUAL(top_surface_speed);
-		RETURN_COMPARE_NON_EQUAL(solid_infill_speed);
+		if (this->sparse_infill_speed != rhs.sparse_infill_speed) return this->sparse_infill_speed < rhs.sparse_infill_speed;
+		if (this->top_surface_speed != rhs.top_surface_speed) return this->top_surface_speed < rhs.top_surface_speed;
+		if (this->solid_infill_speed != rhs.solid_infill_speed) return this->solid_infill_speed < rhs.solid_infill_speed;
 		RETURN_COMPARE_NON_EQUAL(bridge_speed);
 		RETURN_COMPARE_NON_EQUAL(infill_shift_step);
 		RETURN_COMPARE_NON_EQUAL(infill_rotate_step);
@@ -341,9 +341,11 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                             layer.get_filament_config_idx(filament_id));
 
                         if (use_filament_bridge_speed)
-                            params.solid_infill_speed = layerm.layer()->object()->print()->config().filament_bridge_speed.get_at(layer.get_process_config_idx(filament_id));
+                            params.solid_infill_speed = FloatOrPercent(
+                                layerm.layer()->object()->print()->config().filament_bridge_speed.get_at(layer.get_process_config_idx(filament_id)), false);
                         else
-							params.solid_infill_speed = region_config.bridge_speed.get_at(layer.get_process_config_idx(params.extruder));
+							params.solid_infill_speed = FloatOrPercent(
+                                region_config.bridge_speed.get_at(layer.get_process_config_idx(params.extruder)), false);
 					}
                 } else if (params.extrusion_role == erBridgeInfill) {
                     params.bridge_speed = region_config.bridge_speed.get_at(layer.get_process_config_idx(params.extruder));

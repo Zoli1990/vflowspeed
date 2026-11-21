@@ -42,6 +42,17 @@ namespace Slic3r {
         template<class Archive> void serialize(Archive& ar) { ar(this->value); ar(this->percent); }
     };
 
+    // Resolve an absolute speed or a percentage of the filament's maximum volumetric flow.
+    // mm3_per_mm is the actual extrusion cross-section stored on the path.
+    inline double speed_from_vflow_ratio(const FloatOrPercent &setting, double max_volumetric_speed, double mm3_per_mm)
+    {
+        if (mm3_per_mm <= EPSILON || max_volumetric_speed <= 0.0)
+            return (!setting.percent && setting.value > 0.0) ? setting.value : 0.0;
+        if (setting.value <= EPSILON)
+            return max_volumetric_speed / mm3_per_mm;
+        return setting.percent ? max_volumetric_speed * setting.value / 100.0 / mm3_per_mm : setting.value;
+    }
+
     inline bool operator==(const FloatOrPercent& l, const FloatOrPercent& r) throw() { return l.value == r.value && l.percent == r.percent; }
     inline bool operator!=(const FloatOrPercent& l, const FloatOrPercent& r) throw() { return !(l == r); }
     inline bool operator< (const FloatOrPercent& l, const FloatOrPercent& r) throw() { return l.value < r.value || (l.value == r.value && int(l.percent) < int(r.percent)); }

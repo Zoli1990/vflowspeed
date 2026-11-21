@@ -11,7 +11,8 @@
             "displayName": "windows debug Build",
             "description": "",
             "binaryDir": "${sourceDir}/build/debug",
-            "generator": "Visual Studio 18",
+            "generator": "Visual Studio 17 2022",
+            "architecture": "x64",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
                 "CMAKE_PREFIX_PATH": "D:/dep_win_new/usr/local",
@@ -27,7 +28,8 @@
             "displayName": "windows debug Build",
             "description": "",
             "binaryDir": "${sourceDir}/build/debug",
-            "generator": "Visual Studio 18",
+            "generator": "Visual Studio 17 2022",
+            "architecture": "x64",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
                 "CMAKE_PREFIX_PATH": "D:/dep_win_new/usr/local",
@@ -43,7 +45,8 @@
             "displayName": "windows release Build",
             "description": "",
             "binaryDir": "${sourceDir}/build/release",
-            "generator": "Visual Studio 17",
+            "generator": "Visual Studio 17 2022",
+            "architecture": "x64",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
                 "CMAKE_PREFIX_PATH": "D:/dep_win_new/usr/local",
@@ -59,7 +62,8 @@
             "displayName": "windows release Build",
             "description": "",
             "binaryDir": "${sourceDir}/build/release",
-            "generator": "Visual Studio 18",
+            "generator": "Visual Studio 17 2022",
+            "architecture": "x64",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
                 "CMAKE_PREFIX_PATH": "D:/dep_win_new/usr/local",

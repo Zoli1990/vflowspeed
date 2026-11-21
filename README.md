@@ -29,6 +29,17 @@ Other major features are:
 - Assembly & explosion view
 - Flushing transition-filament into infill/object during filament change
 
+# VFlow printing speed
+VFlow adds volumetric-flow-based speed values to supported print-speed settings. Enter a value in `mm/s` to set an absolute speed, or enter a percentage (for example, `50%`) to target that fraction of the selected filament's maximum volumetric speed.
+
+For percentage values, the slicer converts the target flow to a linear speed using the actual extrusion cross-section of each toolpath. This uses the generated line width and layer height, including the rounded sides of the extruded line; nozzle diameter is not used as a substitute for line width. As a result, the resulting `mm/s` speed can vary between paths even when the same percentage is configured.
+
+For example, with a filament maximum of `10 mm³/s`, `50%` targets `5 mm³/s`. A `0.4 mm` line printed at `0.2 mm` layer height has an approximate rounded-rectangle cross-section of `0.0714 mm²`, which corresponds to about `70 mm/s` at that target flow. The actual value is calculated from each sliced path.
+
+Absolute `mm/s` values continue to work as before. The filament maximum volumetric speed remains a cap on extrusion speed, so an absolute setting that would exceed the configured flow limit is reduced accordingly. The shared VFlow conversion is used by G-code speed generation and filament print-time estimation.
+
+VFlow percentages are supported by the inner wall, outer wall, sparse infill, internal solid infill, and top surface speed settings. Other speed settings remain absolute unless their setting explicitly accepts a percentage for another purpose.
+
 # How to compile
 Following platforms are currently supported to compile:
 - Windows 64-bit, [Compile Guide](https://github.com/bambulab/BambuStudio/wiki/Windows-Compile-Guide)

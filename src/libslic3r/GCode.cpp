@@ -1575,17 +1575,6 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
 //#define NOZZLE_CONFIG(OPT)   m_config.OPT.get_at(m_config.filament_map_2.values[m_writer.filament()->id()])
 #define NOZZLE_CONFIG(OPT) m_config.OPT.get_at(get_nozzle_config_index(m_writer.filament()->id()))
 
-static double speed_from_vflow_ratio(const FloatOrPercent &setting, double max_volumetric_speed, double mm3_per_mm)
-{
-    if (mm3_per_mm <= EPSILON || max_volumetric_speed <= 0.0)
-        return (!setting.percent && setting.value > 0.0) ? setting.value : 0.0;
-    if (setting.value <= EPSILON)
-        return max_volumetric_speed / mm3_per_mm;
-    return setting.percent
-        ? max_volumetric_speed * setting.value / 100.0 / mm3_per_mm
-        : setting.value;
-}
-
 // Collect pairs of object_layer + support_layer sorted by print_z.
 // object_layer & support_layer are considered to be on the same print_z, if they are not further than EPSILON.
 std::vector<GCode::LayerToPrint> GCode::collect_layers_to_print(const PrintObject& object, std::string* out_empty_layer_warning)
