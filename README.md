@@ -52,7 +52,7 @@ VFlow percentage input is currently supported by these speed settings:
 - Internal solid infill
 - Top surface
 
-Other speed settings remain absolute unless their setting explicitly accepts a percentage for another purpose. The VFlow conversion is used by G-code speed generation and the relevant print-time estimation path.
+Other speed settings remain absolute unless their setting explicitly accepts a percentage for another purpose. VFlow conversion is applied during G-code speed generation.
 
 # How to compile
 Following platforms are currently supported to compile:
