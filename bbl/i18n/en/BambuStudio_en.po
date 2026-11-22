@@ -23955,3 +23955,27 @@ msgstr ""
 
 #~ msgid "⌥+Left mouse button"
 #~ msgstr "⌥+Left mouse button"
+
+#: src/libslic3r/PrintConfig.cpp
+msgid "This setting defines how much filament volume can be melted and extruded per second. It is also the reference for percentage-based print speeds: for example, 50% targets half of this value. The maximum volumetric speed remains the upper flow limit for both percentage-based and absolute speed settings. Can't be zero."
+msgstr "This setting defines how much filament volume can be melted and extruded per second. It is also the reference for percentage-based print speeds: for example, 50% targets half of this value. The maximum volumetric speed remains the upper flow limit for both percentage-based and absolute speed settings. Can't be zero."
+
+#: src/libslic3r/PrintConfig.cpp
+msgid "Speed of the outermost visible wall. Enter a value in mm/s for an absolute speed, or append % to set a target percentage of the selected filament's Max volumetric speed (for example, 50% targets half of that flow). The percentage is converted to mm/s using the actual extrusion line width and layer height. The filament's Max volumetric speed remains the upper flow limit."
+msgstr "Speed of the outermost visible wall. Enter a value in mm/s for an absolute speed, or append % to set a target percentage of the selected filament's Max volumetric speed (for example, 50% targets half of that flow). The percentage is converted to mm/s using the actual extrusion line width and layer height. The filament's Max volumetric speed remains the upper flow limit."
+
+#: src/libslic3r/PrintConfig.cpp
+msgid "Speed of sparse infill. Enter a value in mm/s for an absolute speed, or append % to set a target percentage of the selected filament's Max volumetric speed (for example, 50% targets half of that flow). The percentage is converted to mm/s using the actual extrusion line width and layer height. The filament's Max volumetric speed remains the upper flow limit."
+msgstr "Speed of sparse infill. Enter a value in mm/s for an absolute speed, or append % to set a target percentage of the selected filament's Max volumetric speed (for example, 50% targets half of that flow). The percentage is converted to mm/s using the actual extrusion line width and layer height. The filament's Max volumetric speed remains the upper flow limit."
+
+#: src/libslic3r/PrintConfig.cpp
+msgid "Speed of inner walls. Enter a value in mm/s for an absolute speed, or append % to set a target percentage of the selected filament's Max volumetric speed (for example, 50% targets half of that flow). The percentage is converted to mm/s using the actual extrusion line width and layer height. The filament's Max volumetric speed remains the upper flow limit."
+msgstr "Speed of inner walls. Enter a value in mm/s for an absolute speed, or append % to set a target percentage of the selected filament's Max volumetric speed (for example, 50% targets half of that flow). The percentage is converted to mm/s using the actual extrusion line width and layer height. The filament's Max volumetric speed remains the upper flow limit."
+
+#: src/libslic3r/PrintConfig.cpp
+msgid "Speed of internal solid infill, not the top and bottom surface. Enter a value in mm/s for an absolute speed, or append % to set a target percentage of the selected filament's Max volumetric speed (for example, 50% targets half of that flow). The percentage is converted to mm/s using the actual extrusion line width and layer height. The filament's Max volumetric speed remains the upper flow limit."
+msgstr "Speed of internal solid infill, not the top and bottom surface. Enter a value in mm/s for an absolute speed, or append % to set a target percentage of the selected filament's Max volumetric speed (for example, 50% targets half of that flow). The percentage is converted to mm/s using the actual extrusion line width and layer height. The filament's Max volumetric speed remains the upper flow limit."
+
+#: src/libslic3r/PrintConfig.cpp
+msgid "Speed of solid top surfaces. Enter a value in mm/s for an absolute speed, or append % to set a target percentage of the selected filament's Max volumetric speed (for example, 50% targets half of that flow). The percentage is converted to mm/s using the actual extrusion line width and layer height. The filament's Max volumetric speed remains the upper flow limit."
+msgstr "Speed of solid top surfaces. Enter a value in mm/s for an absolute speed, or append % to set a target percentage of the selected filament's Max volumetric speed (for example, 50% targets half of that flow). The percentage is converted to mm/s using the actual extrusion line width and layer height. The filament's Max volumetric speed remains the upper flow limit."
