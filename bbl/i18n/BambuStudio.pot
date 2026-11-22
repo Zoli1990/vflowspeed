@@ -14458,7 +14458,7 @@ msgstr ""
 msgid "mm³/s"
 msgstr ""
 
-msgid "This setting stands for how much volume of filament can be melted and extruded per second. Printing speed is limited by max volumetric speed, in case of too high and unreasonable speed setting. Can't be zero"
+msgid "This setting defines how much filament volume can be melted and extruded per second. It is also the reference for percentage-based print speeds: for example, 50% targets half of this value. The maximum volumetric speed remains the upper flow limit for both percentage-based and absolute speed settings. Can't be zero."
 msgstr ""
 
 msgid "Extruder change"
@@ -20417,4 +20417,24 @@ msgstr ""
 
 #: resources/data/helio_hints.ini: [hint: First-Time-Right Reliability]
 msgid "First-Time-Right Reliability\nLess babysitting, more predictable output. Example: a small farm running PETG parts avoids 'fail at hour 6' surprises and keeps batches on schedule."
+msgstr ""
+
+#: src/libslic3r/PrintConfig.cpp
+msgid "Speed of the outermost visible wall. Enter a value in mm/s for an absolute speed, or append % to set a target percentage of the selected filament's Max volumetric speed (for example, 50% targets half of that flow). The percentage is converted to mm/s using the actual extrusion line width and layer height. The filament's Max volumetric speed remains the upper flow limit."
+msgstr ""
+
+#: src/libslic3r/PrintConfig.cpp
+msgid "Speed of sparse infill. Enter a value in mm/s for an absolute speed, or append % to set a target percentage of the selected filament's Max volumetric speed (for example, 50% targets half of that flow). The percentage is converted to mm/s using the actual extrusion line width and layer height. The filament's Max volumetric speed remains the upper flow limit."
+msgstr ""
+
+#: src/libslic3r/PrintConfig.cpp
+msgid "Speed of inner walls. Enter a value in mm/s for an absolute speed, or append % to set a target percentage of the selected filament's Max volumetric speed (for example, 50% targets half of that flow). The percentage is converted to mm/s using the actual extrusion line width and layer height. The filament's Max volumetric speed remains the upper flow limit."
+msgstr ""
+
+#: src/libslic3r/PrintConfig.cpp
+msgid "Speed of internal solid infill, not the top and bottom surface. Enter a value in mm/s for an absolute speed, or append % to set a target percentage of the selected filament's Max volumetric speed (for example, 50% targets half of that flow). The percentage is converted to mm/s using the actual extrusion line width and layer height. The filament's Max volumetric speed remains the upper flow limit."
+msgstr ""
+
+#: src/libslic3r/PrintConfig.cpp
+msgid "Speed of solid top surfaces. Enter a value in mm/s for an absolute speed, or append % to set a target percentage of the selected filament's Max volumetric speed (for example, 50% targets half of that flow). The percentage is converted to mm/s using the actual extrusion line width and layer height. The filament's Max volumetric speed remains the upper flow limit."
 msgstr ""
