@@ -1649,6 +1649,13 @@ struct GlobalSpeedMap
     double supportSpeed;
     double smallPerimeterSpeed;
     double maxSpeed;
+    // VFlow metadata used to resolve percentage-based speed overrides for the auto-brim heuristic.
+    double maxVolumetricSpeed = 0.0;
+    double perimeterMm3PerMm = 0.0;
+    double externalPerimeterMm3PerMm = 0.0;
+    double infillMm3PerMm = 0.0;
+    double solidInfillMm3PerMm = 0.0;
+    double topSolidInfillMm3PerMm = 0.0;
     Polygon bed_poly;
 };
 
