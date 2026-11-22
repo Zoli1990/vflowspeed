@@ -1,5 +1,7 @@
 ![image](https://user-images.githubusercontent.com/106916061/179006347-497d24c0-9bd6-45b7-8c49-d5cc8ecfe5d7.png)
-# BambuStudio
+# VFlow – Bambu Studio modification
+
+This repository is an unofficial Bambu Studio modification based on Bambu Studio 2.9.1.70. It adds volumetric-flow-based percentage input to selected print-speed settings while retaining the original absolute mm/s input.
 Bambu Studio is a cutting-edge, feature-rich slicing software.  
 It contains project-based workflows, systematically optimized slicing algorithms, and an easy-to-use graphic interface, bringing users an incredibly smooth printing experience.
 
@@ -31,28 +33,44 @@ Other major features are:
 
 # VFlow printing speed
 
-VFlow adds volumetric-flow-based speed input to selected print-speed settings. The existing speed fields accept either an absolute speed or a percentage of the selected filament's maximum volumetric flow:
+VFlow adds volumetric-flow-based speed input to five existing print-speed settings. The user can continue entering an absolute speed in mm/s or enter a percentage of the selected filament's `Max volumetric speed` directly in the same field.
 
-- A plain number such as `50` means an absolute print speed of `50 mm/s`.
-- A percentage such as `36%` means a target flow equal to 36% of the selected filament's `Max volumetric speed`.
+## How to enter a speed
+
+- `50` means an absolute print speed of `50 mm/s`.
+- `50%` means a target flow equal to 50% of the selected filament's `Max volumetric speed`.
 - `100%` targets the filament's full configured maximum volumetric flow.
 
-The `Max volumetric speed` value remains in the filament settings. It is the common upper flow limit for both input modes; there is no separate `Target VFlow` filament setting. The existing speed settings remain in the Speed category/tab and are available in Advanced mode.
+The percentage is converted to a linear print speed (`mm/s`) using the actual extrusion cross-section of each toolpath, including its line width and layer height. The same percentage can therefore produce different linear speeds for paths with different cross-sections.
 
-For percentage input, the target volumetric flow is converted to linear speed using the actual extrusion cross-section of each toolpath. The calculation uses the generated line width and layer height, including the rounded sides of the extruded line; nozzle diameter is not used as a substitute for line width. Consequently, the resulting `mm/s` speed can vary between paths even when the same percentage is configured.
+For example, with a filament `Max volumetric speed` of `10 mm³/s`, a `50%` setting targets `5 mm³/s`. The slicer calculates the corresponding `mm/s` speed from each path's actual cross-section.
 
-For example, with a filament maximum of `10 mm³/s`, `50%` targets `5 mm³/s`. A `0.4 mm` line printed at `0.2 mm` layer height has an approximate rounded-rectangle cross-section of `0.0714 mm²`, which corresponds to about `70 mm/s` at that target flow. The actual value is calculated from each sliced path.
+## Filament Max volumetric speed
 
-Absolute `mm/s` values continue to work as before. If an absolute speed would exceed the configured filament flow limit for a toolpath, the speed is reduced to respect that limit. The same filament maximum also caps percentage-based requests. Percentages above `100%` therefore do not currently override the filament maximum; an optional over-100% override is a separate future enhancement and is not part of the current behavior.
+The filament's `Max volumetric speed` now has two related roles:
 
-VFlow percentage input is currently supported by these speed settings:
+1. It is the reference value for percentage-based print speeds. For example, `50%` targets half of this value.
+2. It remains the upper volumetric-flow limit for both percentage-based and absolute `mm/s` speed settings.
+
+There is no separate `Target VFlow` filament setting. To speed up or slow down a percentage-based print profile for a different filament, adjust the filament's `Max volumetric speed` value instead of recalculating every feature speed.
+
+## Supported speed settings
+
+VFlow percentage input is currently supported by these existing settings in the Speed category/tab:
+
 - Inner wall
 - Outer wall
 - Sparse infill
 - Internal solid infill
 - Top surface
 
-Other speed settings remain absolute unless their setting explicitly accepts a percentage for another purpose. VFlow conversion is applied during G-code speed generation.
+Other speed settings remain unchanged and continue to use their existing input behavior.
+
+## Interaction with cooling and other speed limits
+
+VFlow determines the nominal speed needed to reach the requested volumetric flow. It does not override other slicer limits. Maximum print speed, acceleration, overhang rules, minimum layer-time cooling slowdowns and other existing constraints can reduce the final speed written to G-code. The filament's maximum volumetric speed also remains a hard upper flow limit; percentages above `100%` do not currently bypass it.
+
+The generated G-code should be used to verify the final speed and flow on a specific model, because cooling and geometry-dependent constraints can change the actual motion speed.
 
 # How to compile
 Following platforms are currently supported to compile:
