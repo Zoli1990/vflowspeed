@@ -2749,8 +2749,9 @@ void PrintConfigDef::init_fff_params()
     def = this->add("outer_wall_speed", coFloatsOrPercents);
     def->label = L("Outer wall");
     def->category = L("Speed");
-    def->tooltip = L("Speed of the outermost visible wall. Enter mm/s for an absolute speed, "
-                     "or a percentage of the selected filament's maximum volumetric flow.");
+    def->tooltip = L("Speed of the outermost visible wall. Enter a value in mm/s for an absolute speed, or append % to set a target percentage of the selected filament's Max volumetric speed (for example, 50% targets half of that flow). "
+                     "The percentage is converted to mm/s using the actual extrusion line width and layer height. "
+                     "The filament's Max volumetric speed remains the upper flow limit.");
     def->sidetext = L("mm/s or %");
     def->min = 0;
     def->mode = comAdvanced;
@@ -3079,9 +3080,10 @@ void PrintConfigDef::init_fff_params()
 
     def = this->add("filament_max_volumetric_speed", coFloats);
     def->label = L("Max volumetric speed");
-    def->tooltip = L("This setting stands for how much volume of filament can be melted and extruded per second. "
-                     "Printing speed is limited by max volumetric speed, in case of too high and unreasonable speed setting. "
-                     "Can't be zero");
+    def->tooltip = L("This setting defines how much filament volume can be melted and extruded per second. "
+                     "It is also the reference for percentage-based print speeds: for example, 50% targets half of this value. "
+                     "The maximum volumetric speed remains the upper flow limit for both percentage-based and absolute speed settings. "
+                     "Can't be zero.");
     def->sidetext = L("mm³/s");
     def->min = 0;
     def->max = 200;
@@ -4706,8 +4708,9 @@ void PrintConfigDef::init_fff_params()
     def = this->add("sparse_infill_speed", coFloatsOrPercents);
     def->label = L("Sparse infill");
     def->category = L("Speed");
-    def->tooltip = L("Speed of sparse infill. Enter mm/s for an absolute speed, "
-                     "or a percentage of the selected filament's maximum volumetric flow.");
+    def->tooltip = L("Speed of sparse infill. Enter a value in mm/s for an absolute speed, or append % to set a target percentage of the selected filament's Max volumetric speed (for example, 50% targets half of that flow). "
+                     "The percentage is converted to mm/s using the actual extrusion line width and layer height. "
+                     "The filament's Max volumetric speed remains the upper flow limit.");
     def->sidetext = L("mm/s or %");
     def->min = 0;
     def->mode = comAdvanced;
@@ -5350,8 +5353,9 @@ void PrintConfigDef::init_fff_params()
     def = this->add("inner_wall_speed", coFloatsOrPercents);
     def->label = L("Inner wall");
     def->category = L("Speed");
-    def->tooltip = L("Speed of inner walls. Enter mm/s for an absolute speed, "
-                     "or a percentage of the selected filament's maximum volumetric flow.");
+    def->tooltip = L("Speed of inner walls. Enter a value in mm/s for an absolute speed, or append % to set a target percentage of the selected filament's Max volumetric speed (for example, 50% targets half of that flow). "
+                     "The percentage is converted to mm/s using the actual extrusion line width and layer height. "
+                     "The filament's Max volumetric speed remains the upper flow limit.");
     def->sidetext = L("mm/s or %");
     def->aliases = { "perimeter_feed_rate" };
     def->min = 0;
@@ -6112,8 +6116,9 @@ void PrintConfigDef::init_fff_params()
     def = this->add("internal_solid_infill_speed", coFloatsOrPercents);
     def->label = L("Internal solid infill");
     def->category = L("Speed");
-    def->tooltip = L("Speed of internal solid infill, not the top and bottom surface. "
-                     "Enter mm/s for an absolute speed, or a percentage of the selected filament's maximum volumetric flow.");
+    def->tooltip = L("Speed of internal solid infill, not the top and bottom surface. Enter a value in mm/s for an absolute speed, or append % to set a target percentage of the selected filament's Max volumetric speed (for example, 50% targets half of that flow). "
+                     "The percentage is converted to mm/s using the actual extrusion line width and layer height. "
+                     "The filament's Max volumetric speed remains the upper flow limit.");
     def->sidetext = L("mm/s or %");
     def->min = 0;
     def->mode = comAdvanced;
@@ -6802,8 +6807,9 @@ void PrintConfigDef::init_fff_params()
     def = this->add("top_surface_speed", coFloatsOrPercents);
     def->label = L("Top surface");
     def->category = L("Speed");
-    def->tooltip = L("Speed of solid top surfaces. Enter mm/s for an absolute speed, "
-                     "or a percentage of the selected filament's maximum volumetric flow.");
+    def->tooltip = L("Speed of solid top surfaces. Enter a value in mm/s for an absolute speed, or append % to set a target percentage of the selected filament's Max volumetric speed (for example, 50% targets half of that flow). "
+                     "The percentage is converted to mm/s using the actual extrusion line width and layer height. "
+                     "The filament's Max volumetric speed remains the upper flow limit.");
     def->sidetext = L("mm/s or %");
     def->min = 0;
     def->mode = comAdvanced;
