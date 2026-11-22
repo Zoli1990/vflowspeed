@@ -4092,6 +4092,17 @@ const Transform3d &ModelInstance::get_matrix(bool dont_translate, bool dont_rota
 // auto-brim heuristic. The exact path cross-section is not available here, so use
 // the configured role width and layer height as a representative extrusion.
 namespace {
+struct ModelVFlowSpeedMap {
+    double maxVolumetricSpeed = 0.0;
+    double perimeterMm3PerMm = 0.0;
+    double externalPerimeterMm3PerMm = 0.0;
+    double infillMm3PerMm = 0.0;
+    double solidInfillMm3PerMm = 0.0;
+    double topSolidInfillMm3PerMm = 0.0;
+};
+
+ModelVFlowSpeedMap modelVFlowSpeedMap;
+
 double model_extrusion_mm3_per_mm(const ConfigOptionResolver &config, const char *line_width_key)
 {
     const auto *layer_height_opt = config.option<ConfigOptionFloat>("layer_height");
@@ -4155,6 +4166,7 @@ double model_speed_from_vflow_config(
 //BBS
 // BBS set print speed table and find maximum speed
 void Model::setPrintSpeedTable(const DynamicPrintConfig& config, const PrintConfig& print_config) {
+    modelVFlowSpeedMap = ModelVFlowSpeedMap{};
     printSpeedMap.maxSpeed = 0.0;
     printSpeedMap.perimeterSpeed = 0.0;
     printSpeedMap.externalPerimeterSpeed = 0.0;
@@ -4165,41 +4177,41 @@ void Model::setPrintSpeedTable(const DynamicPrintConfig& config, const PrintConf
 
     // TODO multi_extruders: use the active filament ID instead of the first entry.
     const auto *max_vflow_opt = config.option<ConfigOptionFloatsNullable>("filament_max_volumetric_speed");
-    printSpeedMap.maxVolumetricSpeed =
+    modelVFlowSpeedMap.maxVolumetricSpeed =
         max_vflow_opt != nullptr && !max_vflow_opt->values.empty() && std::isfinite(max_vflow_opt->get_at(0))
             ? max_vflow_opt->get_at(0)
             : 0.0;
 
-    printSpeedMap.perimeterMm3PerMm = model_extrusion_mm3_per_mm(config, "inner_wall_line_width");
-    printSpeedMap.externalPerimeterMm3PerMm = model_extrusion_mm3_per_mm(config, "outer_wall_line_width");
-    printSpeedMap.infillMm3PerMm = model_extrusion_mm3_per_mm(config, "sparse_infill_line_width");
-    printSpeedMap.solidInfillMm3PerMm = model_extrusion_mm3_per_mm(config, "internal_solid_infill_line_width");
-    printSpeedMap.topSolidInfillMm3PerMm = model_extrusion_mm3_per_mm(config, "top_surface_line_width");
+    modelVFlowSpeedMap.perimeterMm3PerMm = model_extrusion_mm3_per_mm(config, "inner_wall_line_width");
+    modelVFlowSpeedMap.externalPerimeterMm3PerMm = model_extrusion_mm3_per_mm(config, "outer_wall_line_width");
+    modelVFlowSpeedMap.infillMm3PerMm = model_extrusion_mm3_per_mm(config, "sparse_infill_line_width");
+    modelVFlowSpeedMap.solidInfillMm3PerMm = model_extrusion_mm3_per_mm(config, "internal_solid_infill_line_width");
+    modelVFlowSpeedMap.topSolidInfillMm3PerMm = model_extrusion_mm3_per_mm(config, "top_surface_line_width");
 
     // todo multi_extruders: the following parameters need get exact filament id
     if (config.has("inner_wall_speed")) {
         printSpeedMap.perimeterSpeed = model_speed_from_vflow_config(
-            config, "inner_wall_speed", printSpeedMap.maxVolumetricSpeed, printSpeedMap.perimeterMm3PerMm);
+            config, "inner_wall_speed", modelVFlowSpeedMap.maxVolumetricSpeed, modelVFlowSpeedMap.perimeterMm3PerMm);
         printSpeedMap.maxSpeed = std::max(printSpeedMap.maxSpeed, printSpeedMap.perimeterSpeed);
     }
     if (config.has("outer_wall_speed")) {
         printSpeedMap.externalPerimeterSpeed = model_speed_from_vflow_config(
-            config, "outer_wall_speed", printSpeedMap.maxVolumetricSpeed, printSpeedMap.externalPerimeterMm3PerMm);
+            config, "outer_wall_speed", modelVFlowSpeedMap.maxVolumetricSpeed, modelVFlowSpeedMap.externalPerimeterMm3PerMm);
         printSpeedMap.maxSpeed = std::max(printSpeedMap.maxSpeed, printSpeedMap.externalPerimeterSpeed);
     }
     if (config.has("sparse_infill_speed")) {
         printSpeedMap.infillSpeed = model_speed_from_vflow_config(
-            config, "sparse_infill_speed", printSpeedMap.maxVolumetricSpeed, printSpeedMap.infillMm3PerMm);
+            config, "sparse_infill_speed", modelVFlowSpeedMap.maxVolumetricSpeed, modelVFlowSpeedMap.infillMm3PerMm);
         printSpeedMap.maxSpeed = std::max(printSpeedMap.maxSpeed, printSpeedMap.infillSpeed);
     }
     if (config.has("internal_solid_infill_speed")) {
         printSpeedMap.solidInfillSpeed = model_speed_from_vflow_config(
-            config, "internal_solid_infill_speed", printSpeedMap.maxVolumetricSpeed, printSpeedMap.solidInfillMm3PerMm);
+            config, "internal_solid_infill_speed", modelVFlowSpeedMap.maxVolumetricSpeed, modelVFlowSpeedMap.solidInfillMm3PerMm);
         printSpeedMap.maxSpeed = std::max(printSpeedMap.maxSpeed, printSpeedMap.solidInfillSpeed);
     }
     if (config.has("top_surface_speed")) {
         printSpeedMap.topSolidInfillSpeed = model_speed_from_vflow_config(
-            config, "top_surface_speed", printSpeedMap.maxVolumetricSpeed, printSpeedMap.topSolidInfillMm3PerMm);
+            config, "top_surface_speed", modelVFlowSpeedMap.maxVolumetricSpeed, modelVFlowSpeedMap.topSolidInfillMm3PerMm);
         printSpeedMap.maxSpeed = std::max(printSpeedMap.maxSpeed, printSpeedMap.topSolidInfillSpeed);
     }
     if (config.has("support_speed")) {
@@ -4464,8 +4476,8 @@ double Model::findMaxSpeed(const ModelObject* object) {
         // todo multi_extruders:
         if (objectKey == "inner_wall_speed") {
             perimeterSpeedObj = model_speed_from_vflow_config(
-                object_config, "inner_wall_speed", Model::printSpeedMap.maxVolumetricSpeed,
-                Model::printSpeedMap.perimeterMm3PerMm);
+                object_config, "inner_wall_speed", Model::modelVFlowSpeedMap.maxVolumetricSpeed,
+                Model::modelVFlowSpeedMap.perimeterMm3PerMm);
             if (Model::printSpeedMap.perimeterSpeed > EPSILON) {
                 externalPerimeterSpeedObj =
                     Model::printSpeedMap.externalPerimeterSpeed / Model::printSpeedMap.perimeterSpeed * perimeterSpeedObj;
@@ -4473,22 +4485,22 @@ double Model::findMaxSpeed(const ModelObject* object) {
         }
         if (objectKey == "sparse_infill_speed")
             infillSpeedObj = model_speed_from_vflow_config(
-                object_config, "sparse_infill_speed", Model::printSpeedMap.maxVolumetricSpeed,
-                Model::printSpeedMap.infillMm3PerMm);
+                object_config, "sparse_infill_speed", Model::modelVFlowSpeedMap.maxVolumetricSpeed,
+                Model::modelVFlowSpeedMap.infillMm3PerMm);
         if (objectKey == "internal_solid_infill_speed")
             solidInfillSpeedObj = model_speed_from_vflow_config(
-                object_config, "internal_solid_infill_speed", Model::printSpeedMap.maxVolumetricSpeed,
-                Model::printSpeedMap.solidInfillMm3PerMm);
+                object_config, "internal_solid_infill_speed", Model::modelVFlowSpeedMap.maxVolumetricSpeed,
+                Model::modelVFlowSpeedMap.solidInfillMm3PerMm);
         if (objectKey == "top_surface_speed")
             topSolidInfillSpeedObj = model_speed_from_vflow_config(
-                object_config, "top_surface_speed", Model::printSpeedMap.maxVolumetricSpeed,
-                Model::printSpeedMap.topSolidInfillMm3PerMm);
+                object_config, "top_surface_speed", Model::modelVFlowSpeedMap.maxVolumetricSpeed,
+                Model::modelVFlowSpeedMap.topSolidInfillMm3PerMm);
         if (objectKey == "support_speed")
             supportSpeedObj = object_config.opt_float_nullable(objectKey, 0);
         if (objectKey == "outer_wall_speed")
             externalPerimeterSpeedObj = model_speed_from_vflow_config(
-                object_config, "outer_wall_speed", Model::printSpeedMap.maxVolumetricSpeed,
-                Model::printSpeedMap.externalPerimeterMm3PerMm);
+                object_config, "outer_wall_speed", Model::modelVFlowSpeedMap.maxVolumetricSpeed,
+                Model::modelVFlowSpeedMap.externalPerimeterMm3PerMm);
         if (objectKey == "small_perimeter_speed") {
             const auto *small_perimeter_opt = object_config.option<ConfigOptionFloatsOrPercentsNullable>(objectKey);
             if (small_perimeter_opt != nullptr && !small_perimeter_opt->values.empty())
