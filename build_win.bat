@@ -234,7 +234,7 @@ IF "%PS_STEPS%" NEQ "app-cmake" msbuild /m ALL_BUILD.vcxproj /p:Configuration=%P
 REM Run app
 :RUN_APP
 REM All build steps complete.
-CALL :DIFF_TIME ELAPSED_TIME %START_TIME% %TIME%
+CALL :DIFF_TIME ELAPSED_TIME "%START_TIME%" "%TIME%"
 IF "%PS_CURRENT_STEP%" NEQ "arguments" (
     @ECHO.
     @ECHO Total Build Time Elapsed %ELAPSED_TIME%
@@ -492,14 +492,32 @@ GOTO :EOF
 @REM %1 - Output variable
 @REM %2 - Start time
 @REM %3 - End time
+@REM Parse the fixed HH:mm:ss,cc layout explicitly. This avoids the nested
+@REM SET /A expression that can produce "Unbalanced parenthesis" on some locales.
 setlocal EnableDelayedExpansion
-set START_ARG=%2
-set END_ARG=%3
-set END=!END_ARG:%TIME:~8,1%=%%100)*100+1!
-set START=!START_ARG:%TIME:~8,1%=%%100)*100+1!
-set /A DIFF=((((10!END:%TIME:~2,1%=%%100)*60+1!%%100)-((((10!START:%TIME:~2,1%=%%100)*60+1!%%100), DIFF-=(DIFF^>^>31)*24*60*60*100
+set "START_ARG=%~2"
+set "END_ARG=%~3"
+
+set "START_HH=!START_ARG:~0,2!"
+set "START_MM=!START_ARG:~3,2!"
+set "START_SS=!START_ARG:~6,2!"
+set "START_CC=!START_ARG:~9,2!"
+set "END_HH=!END_ARG:~0,2!"
+set "END_MM=!END_ARG:~3,2!"
+set "END_SS=!END_ARG:~6,2!"
+set "END_CC=!END_ARG:~9,2!"
+
+REM Replace a leading blank hour with zero, then prefix values with 1
+REM so SET /A always interprets them as decimal (not octal).
+set "START_HH=!START_HH: =0!"
+set "END_HH=!END_HH: =0!"
+set /A START_TOTAL=(((1!START_HH!-100)*3600+(1!START_MM!-100)*60+(1!START_SS!-100))*100+(1!START_CC!-100))
+set /A END_TOTAL=(((1!END_HH!-100)*3600+(1!END_MM!-100)*60+(1!END_SS!-100))*100+(1!END_CC!-100))
+set /A DIFF=END_TOTAL-START_TOTAL
+if !DIFF! LSS 0 set /A DIFF+=8640000
+
 set /A CC=DIFF%%100+100,DIFF/=100,SS=DIFF%%60+100,DIFF/=60,MM=DIFF%%60+100,HH=DIFF/60+100
-@endlocal & set %1=%HH:~1%%TIME:~2,1%%MM:~1%%TIME:~2,1%%SS:~1%%TIME:~8,1%%CC:~1%
+@endlocal & set "%~1=%HH:~1%%TIME:~2,1%%MM:~1%%TIME:~2,1%%SS:~1%%TIME:~8,1%%CC:~1%"
 @GOTO :EOF
 
 :WRITE_CUSTOM_SCRIPT_SKELETON
