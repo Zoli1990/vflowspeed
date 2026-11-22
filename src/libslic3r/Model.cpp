@@ -4476,8 +4476,8 @@ double Model::findMaxSpeed(const ModelObject* object) {
         // todo multi_extruders:
         if (objectKey == "inner_wall_speed") {
             perimeterSpeedObj = model_speed_from_vflow_config(
-                object_config, "inner_wall_speed", Model::modelVFlowSpeedMap.maxVolumetricSpeed,
-                Model::modelVFlowSpeedMap.perimeterMm3PerMm);
+                object_config, "inner_wall_speed", modelVFlowSpeedMap.maxVolumetricSpeed,
+                modelVFlowSpeedMap.perimeterMm3PerMm);
             if (Model::printSpeedMap.perimeterSpeed > EPSILON) {
                 externalPerimeterSpeedObj =
                     Model::printSpeedMap.externalPerimeterSpeed / Model::printSpeedMap.perimeterSpeed * perimeterSpeedObj;
@@ -4485,22 +4485,22 @@ double Model::findMaxSpeed(const ModelObject* object) {
         }
         if (objectKey == "sparse_infill_speed")
             infillSpeedObj = model_speed_from_vflow_config(
-                object_config, "sparse_infill_speed", Model::modelVFlowSpeedMap.maxVolumetricSpeed,
-                Model::modelVFlowSpeedMap.infillMm3PerMm);
+                object_config, "sparse_infill_speed", modelVFlowSpeedMap.maxVolumetricSpeed,
+                modelVFlowSpeedMap.infillMm3PerMm);
         if (objectKey == "internal_solid_infill_speed")
             solidInfillSpeedObj = model_speed_from_vflow_config(
-                object_config, "internal_solid_infill_speed", Model::modelVFlowSpeedMap.maxVolumetricSpeed,
-                Model::modelVFlowSpeedMap.solidInfillMm3PerMm);
+                object_config, "internal_solid_infill_speed", modelVFlowSpeedMap.maxVolumetricSpeed,
+                modelVFlowSpeedMap.solidInfillMm3PerMm);
         if (objectKey == "top_surface_speed")
             topSolidInfillSpeedObj = model_speed_from_vflow_config(
-                object_config, "top_surface_speed", Model::modelVFlowSpeedMap.maxVolumetricSpeed,
-                Model::modelVFlowSpeedMap.topSolidInfillMm3PerMm);
+                object_config, "top_surface_speed", modelVFlowSpeedMap.maxVolumetricSpeed,
+                modelVFlowSpeedMap.topSolidInfillMm3PerMm);
         if (objectKey == "support_speed")
             supportSpeedObj = object_config.opt_float_nullable(objectKey, 0);
         if (objectKey == "outer_wall_speed")
             externalPerimeterSpeedObj = model_speed_from_vflow_config(
-                object_config, "outer_wall_speed", Model::modelVFlowSpeedMap.maxVolumetricSpeed,
-                Model::modelVFlowSpeedMap.externalPerimeterMm3PerMm);
+                object_config, "outer_wall_speed", modelVFlowSpeedMap.maxVolumetricSpeed,
+                modelVFlowSpeedMap.externalPerimeterMm3PerMm);
         if (objectKey == "small_perimeter_speed") {
             const auto *small_perimeter_opt = object_config.option<ConfigOptionFloatsOrPercentsNullable>(objectKey);
             if (small_perimeter_opt != nullptr && !small_perimeter_opt->values.empty())
